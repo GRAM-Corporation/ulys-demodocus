@@ -13,9 +13,8 @@ Implement end-to-end processing in `src/gram_deploy/services/pipeline.py`.
 2. Pipeline stages:
    ```
    STAGES = [
-     ("extracting", extract_audio),
-     ("transcribing", transcribe_sources),
-     ("aligning", align_sources),
+     ("transcribing", transcribe_sources),    # S3 → ElevenLabs
+     ("aligning", align_sources),             # Transcript-based
      ("resolving_speakers", resolve_speakers),
      ("merging", merge_transcripts),
      ("analyzing", analyze_semantics),
@@ -24,6 +23,8 @@ Implement end-to-end processing in `src/gram_deploy/services/pipeline.py`.
      ("reporting", generate_report),
    ]
    ```
+
+   **Note:** No audio extraction stage - transcription uses S3 presigned URLs directly.
 
 3. Checkpoint support:
    - Save checkpoint after each stage
@@ -37,7 +38,7 @@ Implement end-to-end processing in `src/gram_deploy/services/pipeline.py`.
    - For CLI progress display
 
 5. Parallel processing:
-   - Multiple sources can extract/transcribe in parallel
+   - Multiple sources can transcribe in parallel
    - Use asyncio or concurrent.futures
 
 6. Error handling:

@@ -4,80 +4,98 @@ Implement speech-to-text in `src/gram_deploy/services/transcription_service.py`.
 
 ## Architecture
 
-Use S3 presigned URLs - ElevenLabs fetches the file directly, no local file handling needed.
+Pure S3 presigned URL flow - no local audio extraction. ElevenLabs fetches video directly from S3.
 
 ```
-Google Drive → S3 (via rclone) → Presigned URL → ElevenLabs fetches directly
+Google Drive → S3 (rclone sync) → Presigned URL → ElevenLabs fetches & transcribes
 ```
+
+**No AudioExtractor dependency.** Transcription services accept video files directly.
 
 ## Tasks
 
-1. `transcribe(s3_key_or_path, provider)` -> RawTranscript:
-   - Generate S3 presigned URL for the audio/video file
-   - Pass URL to provider API (they fetch it)
-   - Return normalized RawTranscript model
+1. `transcribe(source: Source, provider: str)` -> RawTranscript:
+   - Get S3 key from source metadata
+   - Generate presigned URL
+   - Submit to provider API
+   - Poll for completion (if async)
+   - Parse and return RawTranscript
 
-2. `_generate_presigned_url(s3_key)` -> str:
+2. `_get_s3_key(source: Source)` -> str:
+   - Map source to S3 bucket path
+   - Convention: `deployments/{deployment_id}/sources/{source_name}/{filename}`
+
+3. `_generate_presigned_url(s3_key: str, expires_in: int = 3600)` -> str:
    ```python
    import boto3
    s3 = boto3.client('s3')
-   url = s3.generate_presigned_url('get_object',
-       Params={'Bucket': BUCKET, 'Key': s3_key},
-       ExpiresIn=3600)
-   return url
+   return s3.generate_presigned_url('get_object',
+       Params={'Bucket': settings.s3_bucket, 'Key': s3_key},
+       ExpiresIn=expires_in)
    ```
 
-3. `_transcribe_elevenlabs(presigned_url)`:
-   - POST to `https://api.elevenlabs.io/v1/speech-to-text`
-   - Use `url` parameter (ElevenLabs fetches from S3)
-   - Request diarization (speaker separation)
+4. `_transcribe_elevenlabs(url: str)` -> RawTranscript:
    ```python
    response = requests.post(
        'https://api.elevenlabs.io/v1/speech-to-text',
-       headers={'xi-api-key': API_KEY},
-       json={'url': presigned_url}
+       headers={'xi-api-key': settings.elevenlabs_api_key},
+       json={
+           'url': url,
+           'diarization': True,  # speaker separation
+           'timestamps': True
+       }
    )
    ```
-   - Parse response into utterances with speaker labels
+   - Parse response into RawTranscript model
+   - Map speaker labels to TranscriptSpeaker entries
 
-4. `_transcribe_assemblyai(presigned_url)`:
-   - Submit URL directly (AssemblyAI also supports URL input)
-   - Poll for completion
-   - Parse with speaker_labels enabled
+5. `_transcribe_assemblyai(url: str)` -> RawTranscript:
+   - POST to AssemblyAI with URL
+   - Enable `speaker_labels=True`
+   - Poll `GET /transcript/{id}` until complete
+   - Parse response
 
-5. `_transcribe_deepgram(presigned_url)`:
-   - Submit URL to Deepgram API
+6. `_transcribe_deepgram(url: str)` -> RawTranscript:
+   - POST to Deepgram with URL
    - Enable diarization
    - Parse response
 
-6. Normalize output:
-   - Convert provider-specific format to `RawTranscript`
-   - Each utterance: text, start_ms, end_ms, speaker_id, confidence
-   - Save to `{source_path}/raw_transcript.json`
+7. Save output:
+   - Write to `{source_path}/raw_transcript.json`
+   - Update source.transcript_status = "complete"
+
+## Config
+
+Add to `src/gram_deploy/config.py`:
+```python
+s3_bucket: str = Field(validation_alias="GRAM_S3_BUCKET")
+s3_region: str = Field(default="us-east-1", validation_alias="AWS_REGION")
+```
 
 ## Environment Variables
 
 ```
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
-GRAM_S3_BUCKET=your-bucket
+AWS_REGION=us-east-1
+GRAM_S3_BUCKET=gram-deployments
 ELEVENLABS_API_KEY=...
 ```
 
 ## Reference
 
-- Sample transcript format: `deployments/deploy_20250119_vinci_01/sources/gopro_01/raw_transcript.json`
-- S3 bucket structure mirrors `deployments/` directory
+- Sample output: `deployments/deploy_20250119_vinci_01/sources/gopro_01/raw_transcript.json`
 
 ## Tests
 
 Create `tests/test_transcription_service.py`:
 - Mock boto3 presigned URL generation
-- Mock API responses for each provider
-- Test response parsing
-- Test error handling (rate limits, failures)
+- Mock provider API responses
+- Test RawTranscript parsing
+- Test error handling (expired URLs, rate limits, API failures)
 
 ## Files
 
 - `src/gram_deploy/services/transcription_service.py`
+- `src/gram_deploy/config.py` (add S3 settings)
 - `tests/test_transcription_service.py`
