@@ -55,11 +55,11 @@ class DeploymentManager:
         location_slug = location.lower().replace(" ", "_")
         prefix = f"deploy:{date_compact}_{location_slug}_"
 
-        existing = self.list_deployments(limit=1000)
+        existing = self.list_deployments()
         sequences = [
-            int(d.id.split("_")[-1])
+            int(d.split("_")[-1])
             for d in existing
-            if d.id.startswith(prefix)
+            if d.startswith(prefix)
         ]
         return max(sequences, default=0) + 1
 
@@ -67,6 +67,7 @@ class DeploymentManager:
         self,
         location: str,
         date: str,
+        team_members: Optional[list[str]] = None,
         notes: Optional[str] = None,
     ) -> Deployment:
         """Create a new deployment.
@@ -74,6 +75,7 @@ class DeploymentManager:
         Args:
             location: Human-readable location name
             date: ISO 8601 date (YYYY-MM-DD)
+            team_members: Optional list of person IDs for team members present
             notes: Optional free-form notes
 
         Returns:
@@ -86,6 +88,7 @@ class DeploymentManager:
             id=deployment_id,
             location=location,
             date=date,
+            team_members=team_members or [],
             notes=notes,
             status=DeploymentStatus.INGESTING,
         )
@@ -126,8 +129,57 @@ class DeploymentManager:
         data = json.loads(deployment_path.read_text())
         return Deployment.model_validate(data)
 
-    def list_deployments(self, limit: int = 50, offset: int = 0) -> list[Deployment]:
-        """List deployments in reverse chronological order.
+    def load_deployment(self, deployment_id: str) -> Deployment:
+        """Load a deployment by ID.
+
+        This method raises an exception if the deployment is not found,
+        unlike get_deployment which returns None.
+
+        Args:
+            deployment_id: The deployment ID
+
+        Returns:
+            The Deployment entity
+
+        Raises:
+            ValueError: If the deployment is not found
+        """
+        deployment = self.get_deployment(deployment_id)
+        if deployment is None:
+            raise ValueError(f"Deployment not found: {deployment_id}")
+        return deployment
+
+    def save_deployment(self, deployment: Deployment) -> None:
+        """Save a deployment to disk.
+
+        Updates the updated_at timestamp and persists the deployment.
+
+        Args:
+            deployment: The Deployment entity to save
+        """
+        deployment.updated_at = datetime.utcnow()
+        self._save_deployment(deployment)
+
+    def list_deployments(self) -> list[str]:
+        """List all deployment IDs.
+
+        Reads the deployment index and returns all deployment IDs
+        in reverse chronological order.
+
+        Returns:
+            List of deployment ID strings
+        """
+        index_path = self.data_dir / "index.json"
+        index = json.loads(index_path.read_text())
+
+        deployment_ids = index.get("deployments", [])
+        # Sort by date descending (ID contains date)
+        deployment_ids.sort(reverse=True)
+
+        return deployment_ids
+
+    def get_deployments(self, limit: int = 50, offset: int = 0) -> list[Deployment]:
+        """Get deployments in reverse chronological order.
 
         Args:
             limit: Maximum number of deployments to return
@@ -136,12 +188,7 @@ class DeploymentManager:
         Returns:
             List of Deployment entities
         """
-        index_path = self.data_dir / "index.json"
-        index = json.loads(index_path.read_text())
-
-        deployment_ids = index.get("deployments", [])
-        # Sort by date descending (ID contains date)
-        deployment_ids.sort(reverse=True)
+        deployment_ids = self.list_deployments()
 
         deployments = []
         for did in deployment_ids[offset:offset + limit]:
@@ -261,10 +308,10 @@ class DeploymentManager:
         if len(parts) != 2:
             return None
 
-        deployment_id = parts[0]
+        deployment_id = parts[0]  # Already includes "deploy:" prefix
         device_part = parts[1]  # gopro_01
 
-        deploy_dir = self._get_deployment_dir(f"deploy:{deployment_id}")
+        deploy_dir = self._get_deployment_dir(deployment_id)
         source_path = deploy_dir / "sources" / device_part / "source.json"
 
         if not source_path.exists():
@@ -320,6 +367,31 @@ class DeploymentManager:
             deployment.error_message = error_message
 
         self.update_deployment(deployment)
+
+    def update_status(
+        self,
+        deployment_id: str,
+        status: str,
+        checkpoint: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Update the processing status of a deployment.
+
+        This is an alias for set_deployment_status with a slightly different
+        parameter name (error instead of error_message) to match the spec.
+
+        Args:
+            deployment_id: The deployment ID
+            status: New status value
+            checkpoint: Optional checkpoint name
+            error: Optional error message if status is FAILED
+        """
+        self.set_deployment_status(
+            deployment_id=deployment_id,
+            status=status,
+            checkpoint=checkpoint,
+            error_message=error,
+        )
 
     def _save_deployment(self, deployment: Deployment) -> None:
         """Save deployment to disk."""
