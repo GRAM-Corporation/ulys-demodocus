@@ -5,6 +5,7 @@ Responsible for:
 - Extracting events, action items, and insights using LLM
 - Merging and deduplicating results across segments
 - Caching LLM responses
+- Saving analysis results to deployment directory
 """
 
 import hashlib
@@ -12,7 +13,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from gram_deploy.models import (
     ActionItem,
@@ -27,6 +28,7 @@ from gram_deploy.models import (
     Priority,
     Severity,
     SupportingEvidence,
+    TimeRange,
 )
 
 
@@ -45,16 +47,256 @@ class SemanticAnalyzer:
 
     SEGMENT_DURATION_MS = 10 * 60 * 1000  # 10 minutes per segment
 
-    def __init__(self, llm_client: Any, cache_dir: str):
+    def __init__(
+        self,
+        llm_client: Any,
+        cache_dir: Optional[str] = None,
+        data_dir: Optional[str] = None,
+    ):
         """Initialize the analyzer.
 
         Args:
             llm_client: Client for LLM API (e.g., Anthropic client)
-            cache_dir: Directory for caching LLM responses
+            cache_dir: Directory for caching LLM responses (defaults to data_dir/cache/llm_responses)
+            data_dir: Root directory for deployment data (default: "deployments")
         """
         self.llm_client = llm_client
-        self.cache_dir = Path(cache_dir)
+        self.data_dir = Path(data_dir) if data_dir else Path("deployments")
+
+        if cache_dir:
+            self.cache_dir = Path(cache_dir)
+        else:
+            self.cache_dir = self.data_dir / "cache" / "llm_responses"
+
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def analyze(
+        self,
+        deployment: Union[Deployment, str],
+        data_dir: Optional[str] = None,
+    ) -> SemanticAnalysisResult:
+        """Analyze a deployment, loading transcripts and saving results.
+
+        This is the main entry point for semantic analysis. It:
+        1. Loads canonical transcript from deployment directory
+        2. Runs all extraction pipelines (events, action items, insights)
+        3. Generates a summary
+        4. Saves results to deployment directory
+
+        Args:
+            deployment: Deployment entity or deployment ID string
+            data_dir: Optional override for data directory
+
+        Returns:
+            SemanticAnalysisResult with events, action items, insights, and summary
+        """
+        effective_data_dir = Path(data_dir) if data_dir else self.data_dir
+
+        # Load deployment if ID string provided
+        if isinstance(deployment, str):
+            deployment = self._load_deployment(deployment, effective_data_dir)
+
+        # Load canonical utterances
+        utterances = self._load_canonical_utterances(deployment, effective_data_dir)
+
+        # Load people names for speaker mapping
+        people_names = self._load_people_names(effective_data_dir)
+
+        # Run the analysis
+        result = self.analyze_deployment(deployment, utterances, people_names)
+
+        # Save results to deployment directory
+        self._save_results(result, deployment, effective_data_dir)
+
+        return result
+
+    def _load_deployment(
+        self,
+        deployment_id: str,
+        data_dir: Path,
+    ) -> Deployment:
+        """Load a deployment from disk.
+
+        Args:
+            deployment_id: The deployment ID
+            data_dir: Root data directory
+
+        Returns:
+            Deployment entity
+
+        Raises:
+            FileNotFoundError: If deployment not found
+        """
+        deploy_dir = self._get_deployment_dir(deployment_id, data_dir)
+        deployment_path = deploy_dir / "deployment.json"
+
+        if not deployment_path.exists():
+            raise FileNotFoundError(f"Deployment not found: {deployment_id}")
+
+        data = json.loads(deployment_path.read_text())
+        return Deployment.model_validate(data)
+
+    def _get_deployment_dir(self, deployment_id: str, data_dir: Path) -> Path:
+        """Get the directory path for a deployment.
+
+        Args:
+            deployment_id: The deployment ID (e.g., "deploy:20250119_vinci_01")
+            data_dir: Root data directory
+
+        Returns:
+            Path to deployment directory
+        """
+        # Convert deploy:20250119_vinci_01 to deploy_20250119_vinci_01
+        dir_name = deployment_id.replace(":", "_")
+        return data_dir / dir_name
+
+    def _load_canonical_utterances(
+        self,
+        deployment: Deployment,
+        data_dir: Path,
+    ) -> list[CanonicalUtterance]:
+        """Load canonical utterances from deployment directory.
+
+        Args:
+            deployment: The Deployment entity
+            data_dir: Root data directory
+
+        Returns:
+            List of CanonicalUtterance entities
+        """
+        deploy_dir = self._get_deployment_dir(deployment.id, data_dir)
+        transcript_path = deploy_dir / "canonical" / "transcript.json"
+
+        if not transcript_path.exists():
+            return []
+
+        data = json.loads(transcript_path.read_text())
+
+        # Handle both array format and object with utterances key
+        if isinstance(data, list):
+            utterances_data = data
+        else:
+            utterances_data = data.get("utterances", [])
+
+        return [CanonicalUtterance.model_validate(u) for u in utterances_data]
+
+    def _load_people_names(self, data_dir: Path) -> dict[str, str]:
+        """Load people names mapping from registry.
+
+        Args:
+            data_dir: Root data directory
+
+        Returns:
+            Dict mapping person_id to display name
+        """
+        registry_path = data_dir / "people.json"
+
+        if not registry_path.exists():
+            return {}
+
+        data = json.loads(registry_path.read_text())
+        people_names = {}
+
+        for person_data in data.get("people", []):
+            person_id = person_data.get("id")
+            name = person_data.get("name")
+            if person_id and name:
+                people_names[person_id] = name
+
+        return people_names
+
+    def _save_results(
+        self,
+        result: SemanticAnalysisResult,
+        deployment: Deployment,
+        data_dir: Path,
+    ) -> None:
+        """Save analysis results to deployment directory.
+
+        Saves:
+        - events.json: List of extracted events
+        - action_items.json: List of extracted action items
+        - insights.json: List of extracted insights
+        - summary.md: Executive summary
+
+        Args:
+            result: The analysis results
+            deployment: The Deployment entity
+            data_dir: Root data directory
+        """
+        deploy_dir = self._get_deployment_dir(deployment.id, data_dir)
+
+        # Save events
+        self._save_events(result.events, deploy_dir)
+
+        # Save action items
+        self._save_action_items(result.action_items, deploy_dir)
+
+        # Save insights
+        self._save_insights(result.insights, deploy_dir)
+
+        # Save summary
+        if result.summary:
+            self._save_summary(result.summary, deploy_dir)
+
+    def _save_events(
+        self,
+        events: list[DeploymentEvent],
+        deploy_dir: Path,
+    ) -> None:
+        """Save events to deployment/events.json.
+
+        Args:
+            events: List of DeploymentEvent entities
+            deploy_dir: Deployment directory path
+        """
+        events_path = deploy_dir / "events.json"
+        events_data = [e.model_dump(mode="json") for e in events]
+        events_path.write_text(json.dumps(events_data, indent=2, default=str))
+
+    def _save_action_items(
+        self,
+        action_items: list[ActionItem],
+        deploy_dir: Path,
+    ) -> None:
+        """Save action items to deployment/action_items.json.
+
+        Args:
+            action_items: List of ActionItem entities
+            deploy_dir: Deployment directory path
+        """
+        items_path = deploy_dir / "action_items.json"
+        items_data = [item.model_dump(mode="json") for item in action_items]
+        items_path.write_text(json.dumps(items_data, indent=2, default=str))
+
+    def _save_insights(
+        self,
+        insights: list[DeploymentInsight],
+        deploy_dir: Path,
+    ) -> None:
+        """Save insights to deployment/insights.json.
+
+        Args:
+            insights: List of DeploymentInsight entities
+            deploy_dir: Deployment directory path
+        """
+        insights_path = deploy_dir / "insights.json"
+        insights_data = [i.model_dump(mode="json") for i in insights]
+        insights_path.write_text(json.dumps(insights_data, indent=2, default=str))
+
+    def _save_summary(
+        self,
+        summary: str,
+        deploy_dir: Path,
+    ) -> None:
+        """Save summary to deployment/summary.md.
+
+        Args:
+            summary: The summary text
+            deploy_dir: Deployment directory path
+        """
+        summary_path = deploy_dir / "summary.md"
+        summary_path.write_text(summary)
 
     def analyze_deployment(
         self,
