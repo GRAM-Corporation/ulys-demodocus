@@ -9,17 +9,55 @@ Usage:
 """
 
 import json
+import logging
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Optional
 
 import click
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 console = Console()
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+
+
+def _signal_handler(signum, frame):
+    """Handle interrupt signals for graceful shutdown."""
+    global _shutdown_requested
+    if _shutdown_requested:
+        # Second interrupt - force exit
+        console.print("\n[red]Forced shutdown[/red]")
+        sys.exit(1)
+    _shutdown_requested = True
+    console.print("\n[yellow]Shutdown requested - finishing current task...[/yellow]")
+
+
+def setup_logging(verbose: bool) -> None:
+    """Configure logging based on verbosity level."""
+    level = logging.DEBUG if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",
+        handlers=[RichHandler(console=console, show_time=False, show_path=verbose)],
+    )
+
+
+class Context:
+    """CLI context for passing state between commands."""
+
+    def __init__(self):
+        self.verbose = False
+        self.config = {}
+
+
+pass_context = click.make_pass_decorator(Context, ensure=True)
 
 
 def get_config() -> dict:
@@ -42,12 +80,16 @@ def get_config() -> dict:
 
 @click.group()
 @click.version_option(version="0.1.0")
-def cli():
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose debug output")
+@pass_context
+def cli(ctx: Context, verbose: bool):
     """GRAM Deployment Processing System.
 
     Transform field deployment footage into structured intelligence.
     """
-    pass
+    ctx.verbose = verbose
+    ctx.config = get_config()
+    setup_logging(verbose)
 
 
 # ============================================================================
@@ -131,6 +173,13 @@ def process_deployment(deployment_id: str, skip_transcription: bool, skip_analys
     """Run the processing pipeline on a deployment."""
     from gram_deploy.services.pipeline import PipelineOrchestrator, ProcessingOptions
 
+    global _shutdown_requested
+    _shutdown_requested = False
+
+    # Set up signal handlers for graceful shutdown
+    original_sigint = signal.signal(signal.SIGINT, _signal_handler)
+    original_sigterm = signal.signal(signal.SIGTERM, _signal_handler)
+
     config = get_config()
     orchestrator = PipelineOrchestrator(config)
 
@@ -141,26 +190,69 @@ def process_deployment(deployment_id: str, skip_transcription: bool, skip_analys
         language=language,
     )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Processing deployment...", total=None)
+    # Define pipeline stages for progress display
+    stages = [
+        ("audio_extraction", "Extracting audio"),
+        ("transcription", "Transcribing audio"),
+        ("alignment", "Aligning sources"),
+        ("speaker_resolution", "Resolving speakers"),
+        ("transcript_merge", "Merging transcripts"),
+        ("semantic_analysis", "Analyzing semantics"),
+        ("search_index", "Building search index"),
+        ("visualization", "Generating timeline"),
+        ("report", "Generating report"),
+    ]
 
-        result = orchestrator.process_deployment(deployment_id, options)
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Processing deployment...", total=len(stages))
 
-    if result.success:
-        console.print(f"\n[green]Processing complete![/green]")
-        console.print(f"  Duration: {result.duration_seconds:.1f}s")
-        console.print(f"  Utterances: {result.metrics.get('utterance_count', 0)}")
-        console.print(f"  Events: {result.metrics.get('event_count', 0)}")
-        console.print(f"  Action items: {result.metrics.get('action_item_count', 0)}")
-    else:
-        console.print(f"\n[red]Processing failed![/red]")
-        for error in result.errors:
-            console.print(f"  - {error}")
-        sys.exit(1)
+            result = orchestrator.process_deployment(deployment_id, options)
+
+            # Update progress based on completed checkpoints
+            completed = len(result.checkpoints_completed)
+            progress.update(task, completed=completed, description="Processing complete")
+
+        if result.success:
+            console.print(f"\n[green]✓ Processing complete![/green]")
+            console.print(f"  Duration: {result.duration_seconds:.1f}s")
+            console.print(f"  Utterances: {result.metrics.get('utterance_count', 0)}")
+            console.print(f"  Events: {result.metrics.get('event_count', 0)}")
+            console.print(f"  Action items: {result.metrics.get('action_item_count', 0)}")
+
+            # Show completed stages
+            if result.checkpoints_completed:
+                console.print(f"\n  Completed stages:")
+                for checkpoint in result.checkpoints_completed:
+                    console.print(f"    [green]✓[/green] {checkpoint}")
+        else:
+            console.print(f"\n[red]✗ Processing failed![/red]")
+            for error in result.errors:
+                console.print(f"  - {error}")
+
+            # Show partial progress
+            if result.checkpoints_completed:
+                console.print(f"\n  Completed stages before failure:")
+                for checkpoint in result.checkpoints_completed:
+                    console.print(f"    [green]✓[/green] {checkpoint}")
+
+            sys.exit(1)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Processing interrupted by user[/yellow]")
+        console.print("  Progress has been saved - resume with same command")
+        sys.exit(130)  # Standard exit code for SIGINT
+
+    finally:
+        # Restore original signal handlers
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
 
 
 @deploy.command("status")
@@ -227,27 +319,62 @@ def list_deployments(limit: int):
 @click.argument("query")
 @click.option("--deployment", "-d", default=None, help="Limit to specific deployment")
 @click.option("--limit", default=20, help="Maximum results")
-def search_transcripts(query: str, deployment: Optional[str], limit: int):
+@click.option("--speaker", "-s", default=None, help="Filter by speaker (person ID)")
+def search_transcripts(query: str, deployment: Optional[str], limit: int, speaker: Optional[str]):
     """Search across deployment transcripts."""
+    from rich.markup import escape
     from gram_deploy.services.search_index import SearchIndexBuilder
+    from gram_deploy.services.speaker_resolution import SpeakerResolutionService
 
     config = get_config()
     index_dir = Path(config["data_dir"]) / "search_index"
     builder = SearchIndexBuilder(str(index_dir))
 
-    if deployment:
-        results = builder.search(deployment, query, limit=limit)
+    # Load people registry for name lookup
+    registry_path = Path(config["data_dir"]) / "people.json"
+    speaker_service = SpeakerResolutionService(str(registry_path))
+    people_names = {p.id: p.name for p in speaker_service.list_people()}
+
+    # Perform search
+    if speaker:
+        results = builder.search_by_speaker(query, speaker, deployment_id=deployment, limit=limit)
     else:
-        results = builder.search_across_deployments(query, limit=limit)
+        results = builder.search(query, deployment_id=deployment, limit=limit)
 
     if not results:
         console.print("No results found.")
         return
 
+    # Display results in a table
+    table = Table(title=f"Search Results for: {query}")
+    table.add_column("Time", style="cyan", width=10)
+    table.add_column("Deployment", style="dim")
+    table.add_column("Speaker", style="bold")
+    table.add_column("Match", no_wrap=False)
+
     for result in results:
-        time_str = f"{result.canonical_time_ms // 60000}:{(result.canonical_time_ms // 1000) % 60:02d}"
-        console.print(f"\n[cyan]{result.deployment_id}[/cyan] @ {time_str}")
-        console.print(f"  [bold]{result.speaker_name or 'Unknown'}:[/bold] {result.snippet}")
+        if result.canonical_time_ms is not None:
+            mins = result.canonical_time_ms // 60000
+            secs = (result.canonical_time_ms // 1000) % 60
+            time_str = f"{mins}:{secs:02d}"
+        else:
+            time_str = "-"
+
+        # Resolve speaker name
+        speaker_name = "Unknown"
+        if result.speaker_id:
+            speaker_name = people_names.get(result.speaker_id, result.speaker_id)
+
+        # Format snippet - convert HTML marks to Rich markup
+        snippet = result.snippet.replace("<mark>", "[yellow]").replace("</mark>", "[/yellow]")
+
+        # Show result type prefix for non-utterances
+        if result.result_type.value != "utterance":
+            snippet = f"[{result.result_type.value}] {snippet}"
+
+        table.add_row(time_str, result.deployment_id, speaker_name, snippet)
+
+    console.print(table)
 
 
 @deploy.command("report")
@@ -344,7 +471,8 @@ def person():
 @person.command("add")
 @click.option("--name", "-n", required=True, help="Full name")
 @click.option("--role", "-r", default=None, help="Job title or role")
-def add_person(name: str, role: Optional[str]):
+@click.option("--aliases", "-a", default=None, help="Comma-separated list of aliases/nicknames")
+def add_person(name: str, role: Optional[str], aliases: Optional[str]):
     """Add a person to the registry."""
     from gram_deploy.models import Person
     from gram_deploy.services.speaker_resolution import SpeakerResolutionService
@@ -354,12 +482,20 @@ def add_person(name: str, role: Optional[str]):
     service = SpeakerResolutionService(str(registry_path))
 
     person = Person.from_name(name, role)
+
+    # Add aliases if provided
+    if aliases:
+        alias_list = [a.strip() for a in aliases.split(",") if a.strip()]
+        person.aliases = alias_list
+
     service.add_person(person)
 
     console.print(f"[green]Added person:[/green] {person.id}")
     console.print(f"  Name: {person.name}")
     if role:
         console.print(f"  Role: {role}")
+    if person.aliases:
+        console.print(f"  Aliases: {', '.join(person.aliases)}")
 
 
 @person.command("list")
@@ -380,6 +516,7 @@ def list_people():
     table = Table(title="People Registry")
     table.add_column("ID", style="cyan")
     table.add_column("Name")
+    table.add_column("Aliases")
     table.add_column("Role")
     table.add_column("Voice Samples")
 
@@ -387,6 +524,7 @@ def list_people():
         table.add_row(
             p.id,
             p.name,
+            ", ".join(p.aliases) if p.aliases else "-",
             p.role or "-",
             str(len(p.voice_samples)),
         )
