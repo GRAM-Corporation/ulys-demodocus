@@ -4,17 +4,23 @@ Responsible for:
 - Running the complete processing pipeline for a deployment
 - Managing checkpoints for resumable processing
 - Coordinating all service components
+- Progress callbacks for CLI display
+- Parallel processing for transcription
 """
 
 import json
-from dataclasses import dataclass
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Protocol
 
 from gram_deploy.models import (
     Deployment,
     DeploymentStatus,
+    RawTranscript,
+    Source,
 )
 
 
@@ -28,6 +34,7 @@ class ProcessingOptions:
     force_reprocess: bool = False
     transcription_provider: str = "elevenlabs"
     language: str = "en"
+    max_parallel_transcriptions: int = 3
 
 
 @dataclass
@@ -43,20 +50,79 @@ class ProcessingResult:
     metrics: dict
 
 
-class PipelineOrchestrator:
-    """Coordinates the full deployment processing pipeline."""
+class ProgressCallbacks(Protocol):
+    """Protocol for progress callbacks."""
 
-    CHECKPOINTS = [
-        "audio_extraction",
-        "transcription",
-        "alignment",
-        "speaker_resolution",
-        "transcript_merge",
-        "semantic_analysis",
-        "search_index",
-        "visualization",
-        "report",
+    def on_stage_start(self, stage_name: str) -> None:
+        """Called when a stage begins."""
+        ...
+
+    def on_stage_complete(self, stage_name: str, duration: float) -> None:
+        """Called when a stage completes successfully."""
+        ...
+
+    def on_error(self, stage_name: str, error: Exception) -> None:
+        """Called when a stage encounters an error."""
+        ...
+
+
+@dataclass
+class DefaultProgressCallbacks:
+    """Default no-op progress callbacks."""
+
+    def on_stage_start(self, stage_name: str) -> None:
+        """Called when a stage begins."""
+        pass
+
+    def on_stage_complete(self, stage_name: str, duration: float) -> None:
+        """Called when a stage completes successfully."""
+        pass
+
+    def on_error(self, stage_name: str, error: Exception) -> None:
+        """Called when a stage encounters an error."""
+        pass
+
+
+class PipelineOrchestrator:
+    """Coordinates the full deployment processing pipeline.
+
+    Implements the processing stages as specified:
+    - transcribing: S3 → ElevenLabs (parallel per source)
+    - aligning: Transcript-based time synchronization
+    - resolving_speakers: Speaker identification
+    - merging: Create canonical transcript
+    - analyzing: LLM-based semantic extraction
+    - indexing: Build FTS5 search index
+    - visualizing: Generate timeline HTML
+    - reporting: Generate deployment report
+
+    Note: No audio extraction stage - transcription uses S3 presigned URLs directly.
+    """
+
+    # Stage names and their corresponding checkpoint values
+    STAGES = [
+        "transcribing",
+        "aligning",
+        "resolving_speakers",
+        "merging",
+        "analyzing",
+        "indexing",
+        "visualizing",
+        "reporting",
     ]
+
+    # Mapping for legacy checkpoint names
+    CHECKPOINT_ALIASES = {
+        "audio_extraction": None,  # Skip legacy audio extraction
+        "transcription": "transcribing",
+        "alignment": "aligning",
+        "speaker_resolution": "resolving_speakers",
+        "transcript_merge": "merging",
+        "semantic_analysis": "analyzing",
+        "search_index": "indexing",
+        "visualization": "visualizing",
+        "report": "reporting",
+    }
 
     def __init__(self, config: dict[str, Any]):
         """Initialize the orchestrator.
@@ -69,7 +135,6 @@ class PipelineOrchestrator:
 
         # Initialize services lazily
         self._deployment_manager = None
-        self._audio_extractor = None
         self._transcription_service = None
         self._alignment_service = None
         self._speaker_service = None
@@ -84,27 +149,21 @@ class PipelineOrchestrator:
         """Get or create DeploymentManager."""
         if self._deployment_manager is None:
             from gram_deploy.services.deployment_manager import DeploymentManager
+
             self._deployment_manager = DeploymentManager(str(self.data_dir))
         return self._deployment_manager
-
-    @property
-    def audio_extractor(self):
-        """Get or create AudioExtractor."""
-        if self._audio_extractor is None:
-            from gram_deploy.services.audio_extractor import AudioExtractor
-            cache_dir = self.data_dir / "cache" / "audio"
-            self._audio_extractor = AudioExtractor(str(cache_dir))
-        return self._audio_extractor
 
     @property
     def transcription_service(self):
         """Get or create TranscriptionService."""
         if self._transcription_service is None:
             from gram_deploy.services.transcription_service import TranscriptionService
+
             provider = self.config.get("transcription_provider", "elevenlabs")
             api_key = self.config.get(f"{provider}_api_key", "")
-            cache_dir = self.data_dir / "cache" / "transcripts"
-            self._transcription_service = TranscriptionService(provider, api_key, str(cache_dir))
+            self._transcription_service = TranscriptionService(
+                provider, api_key, str(self.data_dir)
+            )
         return self._transcription_service
 
     @property
@@ -112,8 +171,8 @@ class PipelineOrchestrator:
         """Get or create TimeAlignmentService."""
         if self._alignment_service is None:
             from gram_deploy.services.time_alignment import TimeAlignmentService
-            cache_dir = self.data_dir / "cache" / "alignment"
-            self._alignment_service = TimeAlignmentService(str(cache_dir))
+
+            self._alignment_service = TimeAlignmentService(str(self.data_dir))
         return self._alignment_service
 
     @property
@@ -121,6 +180,7 @@ class PipelineOrchestrator:
         """Get or create SpeakerResolutionService."""
         if self._speaker_service is None:
             from gram_deploy.services.speaker_resolution import SpeakerResolutionService
+
             registry_path = self.data_dir / "people.json"
             self._speaker_service = SpeakerResolutionService(str(registry_path))
         return self._speaker_service
@@ -130,6 +190,7 @@ class PipelineOrchestrator:
         """Get or create TranscriptMerger."""
         if self._merger is None:
             from gram_deploy.services.transcript_merger import TranscriptMerger
+
             self._merger = TranscriptMerger()
         return self._merger
 
@@ -139,7 +200,10 @@ class PipelineOrchestrator:
         if self._analyzer is None:
             from gram_deploy.services.semantic_analyzer import SemanticAnalyzer
             import anthropic
-            client = anthropic.Anthropic(api_key=self.config.get("anthropic_api_key", ""))
+
+            client = anthropic.Anthropic(
+                api_key=self.config.get("anthropic_api_key", "")
+            )
             cache_dir = self.data_dir / "cache" / "llm"
             self._analyzer = SemanticAnalyzer(client, str(cache_dir))
         return self._analyzer
@@ -149,6 +213,7 @@ class PipelineOrchestrator:
         """Get or create SearchIndexBuilder."""
         if self._search_builder is None:
             from gram_deploy.services.search_index import SearchIndexBuilder
+
             index_dir = self.data_dir / "search_index"
             self._search_builder = SearchIndexBuilder(str(index_dir))
         return self._search_builder
@@ -158,6 +223,7 @@ class PipelineOrchestrator:
         """Get or create TimelineVisualizer."""
         if self._visualizer is None:
             from gram_deploy.services.timeline_visualizer import TimelineVisualizer
+
             self._visualizer = TimelineVisualizer()
         return self._visualizer
 
@@ -166,25 +232,53 @@ class PipelineOrchestrator:
         """Get or create ReportGenerator."""
         if self._report_generator is None:
             from gram_deploy.services.report_generator import ReportGenerator
+
             template_dir = self.data_dir / "templates"
             self._report_generator = ReportGenerator(str(template_dir))
         return self._report_generator
+
+    def process(
+        self,
+        deployment_id: str,
+        resume: bool = True,
+        options: Optional[ProcessingOptions] = None,
+        callbacks: Optional[ProgressCallbacks] = None,
+    ) -> ProcessingResult:
+        """Run the complete processing pipeline for a deployment.
+
+        This is the main entry point per the spec.
+
+        Args:
+            deployment_id: The deployment to process
+            resume: If True, resume from last checkpoint (default True)
+            options: Processing options
+            callbacks: Progress callbacks for CLI display
+
+        Returns:
+            ProcessingResult with status and metrics
+        """
+        return self.process_deployment(deployment_id, options, callbacks, resume=resume)
 
     def process_deployment(
         self,
         deployment_id: str,
         options: Optional[ProcessingOptions] = None,
+        callbacks: Optional[ProgressCallbacks] = None,
+        resume: bool = True,
     ) -> ProcessingResult:
         """Run the complete processing pipeline for a deployment.
 
         Args:
             deployment_id: The deployment to process
             options: Processing options
+            callbacks: Progress callbacks for CLI display
+            resume: If True, resume from last checkpoint
 
         Returns:
             ProcessingResult with status and metrics
         """
         options = options or ProcessingOptions()
+        callbacks = callbacks or DefaultProgressCallbacks()
         start_time = datetime.utcnow()
         errors: list[str] = []
         completed_checkpoints: list[str] = []
@@ -202,13 +296,10 @@ class PipelineOrchestrator:
                 metrics={},
             )
 
-        # Determine starting checkpoint
-        start_checkpoint = 0
-        if not options.force_reprocess and deployment.checkpoint:
-            try:
-                start_checkpoint = self.CHECKPOINTS.index(deployment.checkpoint) + 1
-            except ValueError:
-                start_checkpoint = 0
+        # Determine starting stage based on checkpoint
+        start_stage_index = 0
+        if resume and not options.force_reprocess and deployment.checkpoint:
+            start_stage_index = self._get_resume_stage_index(deployment.checkpoint)
 
         # Get sources
         sources = self.deployment_manager.get_sources(deployment_id)
@@ -224,125 +315,187 @@ class PipelineOrchestrator:
             )
 
         # Initialize data containers
-        audio_paths: dict[str, list[str]] = {}
-        transcripts = []
+        transcripts: list[RawTranscript] = []
         speaker_mappings = []
         utterances = []
         events = []
         action_items = []
         insights = []
+        summary = ""
 
         try:
-            # Step 1: Audio Extraction
-            if start_checkpoint <= 0:
-                self._update_status(deployment_id, "ingesting", "audio_extraction")
-                for source in sources:
-                    paths = self.audio_extractor.extract_for_source(source)
-                    audio_paths[source.id] = paths
-                completed_checkpoints.append("audio_extraction")
+            # Stage 1: Transcription
+            stage_idx = 0
+            if start_stage_index <= stage_idx and not options.skip_transcription:
+                stage_start = time.time()
+                callbacks.on_stage_start("transcribing")
+                self._update_status(deployment_id, "transcribing", None)
 
-            # Step 2: Transcription
-            if start_checkpoint <= 1 and not options.skip_transcription:
-                self._update_status(deployment_id, "transcribing", "transcription")
-                for source in sources:
-                    paths = audio_paths.get(source.id, [])
-                    if paths:
-                        transcript = self.transcription_service.transcribe_source(
-                            source, paths, options.language
-                        )
-                        transcripts.append(transcript)
-                        self._save_transcript(deployment_id, source.id, transcript)
-                completed_checkpoints.append("transcription")
+                transcripts = self._transcribe_sources_parallel(
+                    sources, options.language, options.max_parallel_transcriptions
+                )
+
+                # Save transcripts
+                for source, transcript in zip(sources, transcripts):
+                    self._save_transcript(deployment_id, source.id, transcript)
+
+                self._update_status(deployment_id, "transcribing", "transcribing")
+                callbacks.on_stage_complete("transcribing", time.time() - stage_start)
+                completed_checkpoints.append("transcribing")
             else:
                 # Load existing transcripts
                 transcripts = self._load_transcripts(deployment_id, sources)
 
-            # Step 3: Time Alignment
-            if start_checkpoint <= 2 and not options.skip_alignment:
-                self._update_status(deployment_id, "aligning", "alignment")
+            # Stage 2: Alignment
+            stage_idx = 1
+            if start_stage_index <= stage_idx and not options.skip_alignment:
+                stage_start = time.time()
+                callbacks.on_stage_start("aligning")
+                self._update_status(deployment_id, "aligning", "transcribing")
 
-                # Compute fingerprints
-                fingerprints = {}
-                for source in sources:
-                    paths = audio_paths.get(source.id, [])
-                    if paths:
-                        fp = self.audio_extractor.get_audio_fingerprint(paths[0])
-                        fingerprints[source.id] = fp
-
-                alignment = self.alignment_service.compute_alignment(
-                    sources, transcripts, fingerprints
+                alignments = self.alignment_service.align_sources(
+                    deployment, sources, transcripts
                 )
-                self.alignment_service.apply_alignment(alignment, sources)
 
-                # Update sources with alignment
-                for source in sources:
-                    self._save_source(deployment_id, source)
+                # Apply alignment to sources
+                self.alignment_service.calculate_canonical_timeline(deployment, alignments)
+                self.alignment_service.save_alignment_results(deployment, alignments)
 
-                # Save alignment
-                self._save_alignment(deployment_id, alignment)
-                completed_checkpoints.append("alignment")
+                # Save updated deployment
+                self.deployment_manager.save_deployment(deployment)
 
-            # Step 4: Speaker Resolution
-            if start_checkpoint <= 3:
-                self._update_status(deployment_id, "aligning", "speaker_resolution")
+                # Reload sources with updated offsets
+                sources = self.deployment_manager.get_sources(deployment_id)
+
+                self._update_status(deployment_id, "aligning", "aligning")
+                callbacks.on_stage_complete("aligning", time.time() - stage_start)
+                completed_checkpoints.append("aligning")
+
+            # Stage 3: Speaker Resolution
+            stage_idx = 2
+            if start_stage_index <= stage_idx:
+                stage_start = time.time()
+                callbacks.on_stage_start("resolving_speakers")
+                self._update_status(deployment_id, "aligning", "aligning")
+
                 speaker_mappings = self.speaker_service.resolve_speakers(
                     deployment_id, sources, transcripts
                 )
                 self._save_speaker_mappings(deployment_id, speaker_mappings)
-                completed_checkpoints.append("speaker_resolution")
+
+                self._update_status(deployment_id, "aligning", "resolving_speakers")
+                callbacks.on_stage_complete(
+                    "resolving_speakers", time.time() - stage_start
+                )
+                completed_checkpoints.append("resolving_speakers")
             else:
                 speaker_mappings = self._load_speaker_mappings(deployment_id)
 
-            # Step 5: Transcript Merge
-            if start_checkpoint <= 4:
-                self._update_status(deployment_id, "analyzing", "transcript_merge")
+            # Stage 4: Transcript Merge
+            stage_idx = 3
+            if start_stage_index <= stage_idx:
+                stage_start = time.time()
+                callbacks.on_stage_start("merging")
+                self._update_status(deployment_id, "analyzing", "resolving_speakers")
+
                 utterances = self.merger.merge(sources, transcripts, speaker_mappings)
                 self._save_utterances(deployment_id, utterances)
-                completed_checkpoints.append("transcript_merge")
+
+                self._update_status(deployment_id, "analyzing", "merging")
+                callbacks.on_stage_complete("merging", time.time() - stage_start)
+                completed_checkpoints.append("merging")
             else:
                 utterances = self._load_utterances(deployment_id)
 
-            # Step 6: Semantic Analysis
-            if start_checkpoint <= 5 and not options.skip_analysis:
-                self._update_status(deployment_id, "analyzing", "semantic_analysis")
+            # Stage 5: Semantic Analysis
+            stage_idx = 4
+            if start_stage_index <= stage_idx and not options.skip_analysis:
+                stage_start = time.time()
+                callbacks.on_stage_start("analyzing")
+                self._update_status(deployment_id, "analyzing", "merging")
+
                 people_names = self._get_people_names()
-                result = self.analyzer.analyze_deployment(deployment, utterances, people_names)
+                result = self.analyzer.analyze_deployment(
+                    deployment, utterances, people_names
+                )
                 events = result.events
                 action_items = result.action_items
                 insights = result.insights
-                self._save_analysis(deployment_id, events, action_items, insights)
-                completed_checkpoints.append("semantic_analysis")
+                summary = result.summary
+                self._save_analysis(deployment_id, events, action_items, insights, summary)
+
+                self._update_status(deployment_id, "analyzing", "analyzing")
+                callbacks.on_stage_complete("analyzing", time.time() - stage_start)
+                completed_checkpoints.append("analyzing")
             else:
-                events, action_items, insights = self._load_analysis(deployment_id)
+                events, action_items, insights, summary = self._load_analysis(
+                    deployment_id
+                )
 
-            # Step 7: Search Index
-            if start_checkpoint <= 6:
-                people_names = self._get_people_names()
-                self.search_builder.build_index(deployment_id, utterances, people_names)
-                completed_checkpoints.append("search_index")
+            # Stage 6: Search Index
+            stage_idx = 5
+            if start_stage_index <= stage_idx:
+                stage_start = time.time()
+                callbacks.on_stage_start("indexing")
+                self._update_status(deployment_id, "analyzing", "analyzing")
 
-            # Step 8: Visualization
-            if start_checkpoint <= 7:
+                self.search_builder.build_index(deployment)
+                self.search_builder.index_utterances(deployment, utterances)
+                self.search_builder.index_events(deployment, events)
+                self.search_builder.index_insights(deployment, insights)
+
+                self._update_status(deployment_id, "analyzing", "indexing")
+                callbacks.on_stage_complete("indexing", time.time() - stage_start)
+                completed_checkpoints.append("indexing")
+
+            # Stage 7: Visualization
+            stage_idx = 6
+            if start_stage_index <= stage_idx:
+                stage_start = time.time()
+                callbacks.on_stage_start("visualizing")
+                self._update_status(deployment_id, "analyzing", "indexing")
+
                 people_names = self._get_people_names()
                 timeline_html = self.visualizer.generate_timeline_html(
                     deployment, sources, utterances, events, people_names
                 )
                 self._save_output(deployment_id, "timeline.html", timeline_html)
-                completed_checkpoints.append("visualization")
 
-            # Step 9: Report
-            if start_checkpoint <= 8:
+                self._update_status(deployment_id, "analyzing", "visualizing")
+                callbacks.on_stage_complete("visualizing", time.time() - stage_start)
+                completed_checkpoints.append("visualizing")
+
+            # Stage 8: Report Generation
+            stage_idx = 7
+            if start_stage_index <= stage_idx:
+                stage_start = time.time()
+                callbacks.on_stage_start("reporting")
+                self._update_status(deployment_id, "analyzing", "visualizing")
+
                 people_names = self._get_people_names()
-                result = self.analyzer.analyze_deployment(deployment, utterances, people_names)
+
+                # Use cached summary if available
+                if not summary and not options.skip_analysis:
+                    _, _, _, summary = self._load_analysis(deployment_id)
+
                 report = self.report_generator.generate_report(
-                    deployment, sources, utterances, events, action_items, insights,
-                    summary=result.summary, people_names=people_names
+                    deployment,
+                    sources,
+                    utterances,
+                    events,
+                    action_items,
+                    insights,
+                    summary=summary,
+                    people_names=people_names,
                 )
                 report_md = self.report_generator.render_markdown(report)
                 report_html = self.report_generator.render_html(report)
                 self._save_output(deployment_id, "report.md", report_md)
                 self._save_output(deployment_id, "report.html", report_html)
-                completed_checkpoints.append("report")
+
+                self._update_status(deployment_id, "complete", "reporting")
+                callbacks.on_stage_complete("reporting", time.time() - stage_start)
+                completed_checkpoints.append("reporting")
 
             # Mark complete
             self._update_status(deployment_id, "complete", "complete")
@@ -360,12 +513,28 @@ class PipelineOrchestrator:
                     "utterance_count": len(utterances),
                     "event_count": len(events),
                     "action_item_count": len(action_items),
+                    "insight_count": len(insights),
                 },
             )
 
         except Exception as e:
-            errors.append(str(e))
-            self._update_status(deployment_id, "failed", deployment.checkpoint, str(e))
+            # Determine which stage failed
+            current_stage = self.STAGES[min(start_stage_index, len(self.STAGES) - 1)]
+            for i, checkpoint in enumerate(self.STAGES):
+                if checkpoint not in completed_checkpoints and i >= start_stage_index:
+                    current_stage = checkpoint
+                    break
+
+            callbacks.on_error(current_stage, e)
+            errors.append(f"{current_stage}: {str(e)}")
+
+            # Update deployment with error
+            self._update_status(
+                deployment_id,
+                "failed",
+                deployment.checkpoint,  # Keep last successful checkpoint
+                str(e),
+            )
 
             duration = (datetime.utcnow() - start_time).total_seconds()
             return ProcessingResult(
@@ -378,6 +547,73 @@ class PipelineOrchestrator:
                 metrics={},
             )
 
+    def _get_resume_stage_index(self, checkpoint: str) -> int:
+        """Get the stage index to resume from based on checkpoint.
+
+        Args:
+            checkpoint: The checkpoint name from deployment
+
+        Returns:
+            Index of the next stage to run (0-based)
+        """
+        # Handle legacy checkpoint names
+        if checkpoint in self.CHECKPOINT_ALIASES:
+            aliased = self.CHECKPOINT_ALIASES[checkpoint]
+            if aliased is None:
+                return 0  # Skip legacy audio extraction, start from transcription
+            checkpoint = aliased
+
+        # Find stage index
+        try:
+            idx = self.STAGES.index(checkpoint)
+            # Resume from next stage after completed checkpoint
+            return idx + 1
+        except ValueError:
+            # Unknown checkpoint, start from beginning
+            return 0
+
+    def _transcribe_sources_parallel(
+        self,
+        sources: list[Source],
+        language: str,
+        max_workers: int = 3,
+    ) -> list[RawTranscript]:
+        """Transcribe multiple sources in parallel.
+
+        Args:
+            sources: List of Source entities to transcribe
+            language: Language code
+            max_workers: Maximum parallel transcription jobs
+
+        Returns:
+            List of RawTranscript objects in same order as sources
+        """
+        transcripts: dict[str, RawTranscript] = {}
+
+        def transcribe_one(source: Source) -> tuple[str, RawTranscript]:
+            transcript = self.transcription_service.transcribe(source, language=language)
+            return source.id, transcript
+
+        # Use ThreadPoolExecutor for parallel transcription
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(sources))) as executor:
+            futures = {
+                executor.submit(transcribe_one, source): source for source in sources
+            }
+
+            for future in as_completed(futures):
+                source = futures[future]
+                try:
+                    source_id, transcript = future.result()
+                    transcripts[source_id] = transcript
+                except Exception as e:
+                    # Re-raise to be caught by main error handler
+                    raise RuntimeError(
+                        f"Transcription failed for source {source.id}: {e}"
+                    ) from e
+
+        # Return in original order
+        return [transcripts[source.id] for source in sources]
+
     def process_source(self, deployment_id: str, source_id: str) -> None:
         """Process a single source (for incremental processing)."""
         # Implementation for adding sources incrementally
@@ -387,7 +623,7 @@ class PipelineOrchestrator:
         self,
         deployment_id: str,
         status: str,
-        checkpoint: str,
+        checkpoint: Optional[str],
         error: Optional[str] = None,
     ) -> None:
         """Update deployment status and checkpoint."""
@@ -400,7 +636,9 @@ class PipelineOrchestrator:
         dir_name = deployment_id.replace(":", "_")
         return self.data_dir / dir_name
 
-    def _save_transcript(self, deployment_id: str, source_id: str, transcript) -> None:
+    def _save_transcript(
+        self, deployment_id: str, source_id: str, transcript: RawTranscript
+    ) -> None:
         """Save a raw transcript."""
         deploy_dir = self._get_deployment_dir(deployment_id)
         # Extract device part from source_id
@@ -409,32 +647,28 @@ class PipelineOrchestrator:
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
         transcript_path.write_text(transcript.model_dump_json(indent=2))
 
-    def _load_transcripts(self, deployment_id: str, sources):
+    def _load_transcripts(
+        self, deployment_id: str, sources: list[Source]
+    ) -> list[RawTranscript]:
         """Load existing transcripts for sources."""
-        from gram_deploy.models import RawTranscript
         transcripts = []
         deploy_dir = self._get_deployment_dir(deployment_id)
         for source in sources:
             device_part = source.id.split("/")[-1]
-            transcript_path = deploy_dir / "sources" / device_part / "raw_transcript.json"
+            transcript_path = (
+                deploy_dir / "sources" / device_part / "raw_transcript.json"
+            )
             if transcript_path.exists():
                 data = json.loads(transcript_path.read_text())
                 transcripts.append(RawTranscript.model_validate(data))
         return transcripts
 
-    def _save_source(self, deployment_id: str, source) -> None:
+    def _save_source(self, deployment_id: str, source: Source) -> None:
         """Save source entity."""
         deploy_dir = self._get_deployment_dir(deployment_id)
         device_part = source.id.split("/")[-1]
         source_path = deploy_dir / "sources" / device_part / "source.json"
         source_path.write_text(source.model_dump_json(indent=2))
-
-    def _save_alignment(self, deployment_id: str, alignment) -> None:
-        """Save alignment data."""
-        deploy_dir = self._get_deployment_dir(deployment_id)
-        alignment_path = deploy_dir / "canonical" / "alignment.json"
-        alignment_path.parent.mkdir(parents=True, exist_ok=True)
-        alignment_path.write_text(alignment.model_dump_json(indent=2))
 
     def _save_speaker_mappings(self, deployment_id: str, mappings) -> None:
         """Save speaker mappings."""
@@ -447,6 +681,7 @@ class PipelineOrchestrator:
     def _load_speaker_mappings(self, deployment_id: str):
         """Load speaker mappings."""
         from gram_deploy.models import SpeakerMapping
+
         deploy_dir = self._get_deployment_dir(deployment_id)
         mappings_path = deploy_dir / "canonical" / "speaker_mappings.json"
         if mappings_path.exists():
@@ -465,6 +700,7 @@ class PipelineOrchestrator:
     def _load_utterances(self, deployment_id: str):
         """Load canonical utterances."""
         from gram_deploy.models import CanonicalUtterance
+
         deploy_dir = self._get_deployment_dir(deployment_id)
         utterances_path = deploy_dir / "canonical" / "utterances.json"
         if utterances_path.exists():
@@ -472,7 +708,14 @@ class PipelineOrchestrator:
             return [CanonicalUtterance.model_validate(u) for u in data]
         return []
 
-    def _save_analysis(self, deployment_id: str, events, action_items, insights) -> None:
+    def _save_analysis(
+        self,
+        deployment_id: str,
+        events,
+        action_items,
+        insights,
+        summary: str = "",
+    ) -> None:
         """Save analysis results."""
         deploy_dir = self._get_deployment_dir(deployment_id)
         analysis_dir = deploy_dir / "analysis"
@@ -487,16 +730,20 @@ class PipelineOrchestrator:
         (analysis_dir / "insights.json").write_text(
             json.dumps([i.model_dump() for i in insights], indent=2, default=str)
         )
+        if summary:
+            (analysis_dir / "summary.txt").write_text(summary)
 
     def _load_analysis(self, deployment_id: str):
         """Load analysis results."""
         from gram_deploy.models import ActionItem, DeploymentEvent, DeploymentInsight
+
         deploy_dir = self._get_deployment_dir(deployment_id)
         analysis_dir = deploy_dir / "analysis"
 
         events = []
         action_items = []
         insights = []
+        summary = ""
 
         events_path = analysis_dir / "events.json"
         if events_path.exists():
@@ -513,7 +760,11 @@ class PipelineOrchestrator:
             data = json.loads(insights_path.read_text())
             insights = [DeploymentInsight.model_validate(i) for i in data]
 
-        return events, action_items, insights
+        summary_path = analysis_dir / "summary.txt"
+        if summary_path.exists():
+            summary = summary_path.read_text()
+
+        return events, action_items, insights, summary
 
     def _save_output(self, deployment_id: str, filename: str, content: str) -> None:
         """Save an output file."""
