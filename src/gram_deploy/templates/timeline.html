@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Timeline: {{ deployment.location }} - {{ deployment.date }}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; }
+        .container { display: flex; height: 100vh; }
+        .timeline-panel { flex: 2; padding: 20px; overflow: hidden; display: flex; flex-direction: column; }
+        .transcript-panel { flex: 1; border-left: 1px solid #333; padding: 20px; overflow-y: auto; background: #16213e; }
+        h1 { font-size: 1.5rem; margin-bottom: 10px; }
+        h2 { font-size: 1.2rem; margin-bottom: 10px; color: #888; }
+        h3 { font-size: 1rem; margin: 10px 0 5px; color: #aaa; }
+        .timeline-container { flex: 1; position: relative; overflow-x: auto; overflow-y: auto; }
+        .timeline { position: relative; min-width: 100%; min-height: 100%; }
+        .time-axis { position: sticky; top: 0; left: 0; right: 0; height: 30px; background: #0f3460; border-bottom: 1px solid #333; z-index: 10; }
+        .time-label { position: absolute; font-size: 12px; color: #888; transform: translateX(-50%); top: 8px; }
+
+        /* Speaker lanes */
+        .speaker-section { margin-top: 35px; }
+        .speaker-lane { position: relative; height: 50px; margin: 5px 0; background: #16213e; border-radius: 4px; border-left: 4px solid; }
+        .speaker-label { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); font-size: 12px; width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; z-index: 5; }
+        .utterance-block { position: absolute; height: 30px; top: 10px; border-radius: 3px; opacity: 0.8; cursor: pointer; min-width: 4px; }
+        .utterance-block:hover { opacity: 1; transform: scaleY(1.1); }
+
+        /* Event markers */
+        .events-section { margin-top: 20px; padding-top: 10px; border-top: 1px solid #333; }
+        .events-track { position: relative; height: 60px; margin-left: 130px; }
+        .event-marker { position: absolute; cursor: pointer; text-align: center; transform: translateX(-50%); }
+        .event-icon { font-size: 20px; display: block; }
+        .event-label { font-size: 10px; color: #aaa; max-width: 80px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .event-tooltip { position: absolute; background: #0f3460; padding: 10px; border-radius: 4px; font-size: 12px; z-index: 100; display: none; min-width: 200px; max-width: 300px; left: 50%; transform: translateX(-50%); top: 45px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .event-marker:hover .event-tooltip { display: block; }
+        .event-tooltip h4 { margin-bottom: 5px; }
+        .event-tooltip p { color: #aaa; }
+
+        /* Action item markers */
+        .action-items-section { margin-top: 10px; padding-top: 10px; border-top: 1px solid #333; }
+        .action-items-track { position: relative; height: 40px; margin-left: 130px; }
+        .action-marker { position: absolute; cursor: pointer; transform: translateX(-50%); }
+        .action-icon { width: 16px; height: 16px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #fff; }
+        .action-tooltip { position: absolute; background: #0f3460; padding: 10px; border-radius: 4px; font-size: 12px; z-index: 100; display: none; min-width: 200px; max-width: 300px; left: 50%; transform: translateX(-50%); top: 25px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .action-marker:hover .action-tooltip { display: block; }
+        .priority-badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin-left: 5px; }
+
+        /* Source tracks */
+        .sources-section { margin-top: 10px; padding-top: 10px; border-top: 1px solid #333; }
+        .source-track { position: relative; height: 35px; margin: 3px 0; background: #16213e; border-radius: 4px; }
+        .source-label { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); font-size: 11px; width: 120px; color: #888; }
+        .source-coverage { position: absolute; height: 25px; top: 5px; border-radius: 3px; opacity: 0.6; cursor: pointer; }
+        .source-coverage:hover { opacity: 0.9; }
+
+        /* Transcript panel */
+        .utterance { padding: 10px; border-bottom: 1px solid #333; cursor: pointer; transition: background 0.2s; }
+        .utterance:hover { background: #0f3460; }
+        .utterance.active { background: #1a4980; border-left: 3px solid #4285F4; }
+        .utterance-time { font-size: 11px; color: #888; }
+        .utterance-speaker { font-weight: bold; margin-left: 10px; }
+        .utterance-text { margin-top: 5px; line-height: 1.4; }
+
+        /* Controls */
+        .controls { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+        .controls button { padding: 8px 16px; background: #0f3460; border: none; color: #eee; border-radius: 4px; cursor: pointer; }
+        .controls button:hover { background: #1a4980; }
+        .controls .time-display { font-family: monospace; background: #0f3460; padding: 8px 16px; border-radius: 4px; }
+
+        /* Playhead */
+        .playhead { position: absolute; width: 2px; background: #fff; z-index: 50; pointer-events: none; top: 0; bottom: 0; left: 130px; }
+
+        /* Legend */
+        .legend { display: flex; gap: 15px; margin: 10px 0; flex-wrap: wrap; font-size: 12px; }
+        .legend-item { display: flex; align-items: center; gap: 5px; }
+        .legend-color { width: 12px; height: 12px; border-radius: 2px; }
+        .legend-icon { font-size: 14px; }
+
+        /* Responsive */
+        @media (max-width: 900px) {
+            .container { flex-direction: column; }
+            .timeline-panel { flex: none; height: 60vh; }
+            .transcript-panel { flex: none; height: 40vh; border-left: none; border-top: 1px solid #333; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="timeline-panel">
+            <h1>{{ deployment.location }} - {{ deployment.date }}</h1>
+            <div class="controls">
+                <button onclick="zoomIn()">Zoom In</button>
+                <button onclick="zoomOut()">Zoom Out</button>
+                <button onclick="resetZoom()">Reset</button>
+                <div class="time-display" id="timeDisplay">00:00:00</div>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><span class="legend-icon">&#x2714;</span> Decision</div>
+                <div class="legend-item"><span class="legend-icon">&#x26A0;</span> Issue</div>
+                <div class="legend-item"><span class="legend-icon">&#x2139;</span> Observation</div>
+                <div class="legend-item"><span class="legend-icon">&#x2605;</span> Milestone</div>
+            </div>
+            <div class="timeline-container" id="timelineContainer">
+                <div class="timeline" id="timeline">
+                    <div class="time-axis" id="timeAxis"></div>
+
+                    <div class="speaker-section">
+                        <h3>Speaker Activity</h3>
+                        {% if speaker_lanes %}
+                            {% for lane in speaker_lanes %}
+                            <div class="speaker-lane" style="border-left-color: {{ lane.color }};">
+                                <div class="speaker-label" style="color: {{ lane.color }};">{{ lane.speaker_name }}</div>
+                                {% for u in lane.utterances %}
+                                <div class="utterance-block"
+                                     style="left: calc(130px + {{ (u.start_ms / duration_ms * 100)|round(4) }}%); width: {{ [0.2, (u.duration_ms / duration_ms * 100)]|max|round(4) }}%; background: {{ lane.color }};"
+                                     data-start="{{ u.start_ms }}" data-end="{{ u.end_ms }}"
+                                     title="{{ u.text[:50] }}...">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% endfor %}
+                        {% else %}
+                            <p style="color: #666; padding: 10px;">No speaker data available</p>
+                        {% endif %}
+                    </div>
+
+                    <div class="events-section">
+                        <h3>Events</h3>
+                        <div class="events-track" id="eventsTrack">
+                            {% if events %}
+                                {% for event in events %}
+                                <div class="event-marker" style="left: {{ (event.time_ms / duration_ms * 100)|round(4) }}%;">
+                                    <span class="event-icon" style="color: {{ event.color }};">{{ event.icon }}</span>
+                                    <span class="event-label">{{ event.title[:15] }}</span>
+                                    <div class="event-tooltip">
+                                        <h4>{{ event.title }}</h4>
+                                        <p><strong>Type:</strong> {{ event.type }}</p>
+                                        <p><strong>Time:</strong> {{ '%02d:%02d:%02d'|format(event.time_ms // 3600000, (event.time_ms // 60000) % 60, (event.time_ms // 1000) % 60) }}</p>
+                                        {% if event.description %}
+                                        <p>{{ event.description }}</p>
+                                        {% endif %}
+                                    </div>
+                                </div>
+                                {% endfor %}
+                            {% else %}
+                                <p style="color: #666; padding: 10px;">No events recorded</p>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <div class="action-items-section">
+                        <h3>Action Items</h3>
+                        <div class="action-items-track" id="actionItemsTrack">
+                            {% if action_items %}
+                                {% for item in action_items %}
+                                <div class="action-marker" style="left: {{ (item.time_ms / duration_ms * 100)|round(4) }}%;">
+                                    <div class="action-icon" style="background: {{ item.priority_color }};">&#x2610;</div>
+                                    <div class="action-tooltip">
+                                        <p><strong>{{ item.description }}</strong></p>
+                                        <p>Priority: <span class="priority-badge" style="background: {{ item.priority_color }};">{{ item.priority }}</span></p>
+                                        <p>Mentioned by: {{ item.mentioned_by or 'Unknown' }}</p>
+                                        <p>Time: {{ '%02d:%02d:%02d'|format(item.time_ms // 3600000, (item.time_ms // 60000) % 60, (item.time_ms // 1000) % 60) }}</p>
+                                    </div>
+                                </div>
+                                {% endfor %}
+                            {% else %}
+                                <p style="color: #666; padding: 10px;">No action items recorded</p>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <div class="sources-section">
+                        <h3>Source Coverage</h3>
+                        {% if source_tracks %}
+                            {% set source_colors = ["#4285F4", "#EA4335", "#FBBC04", "#34A853", "#9C27B0", "#FF6D00"] %}
+                            {% for track in source_tracks %}
+                            <div class="source-track">
+                                <div class="source-label">{{ track.label }}</div>
+                                {% for seg in track.segments %}
+                                <div class="source-coverage"
+                                     style="left: calc(130px + {{ (seg.start_ms / duration_ms * 100)|round(4) }}%); width: {{ [0.2, (seg.duration_ms / duration_ms * 100)]|max|round(4) }}%; background: {{ source_colors[loop.parent.loop.index0 % 6] }};"
+                                     data-start="{{ seg.start_ms }}" data-end="{{ seg.end_ms }}"
+                                     title="{{ seg.filename }}">
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% endfor %}
+                        {% else %}
+                            <p style="color: #666; padding: 10px;">No source data available</p>
+                        {% endif %}
+                    </div>
+
+                    <div class="playhead" id="playhead" style="display: none;"></div>
+                </div>
+            </div>
+        </div>
+        <div class="transcript-panel">
+            <h2>Transcript</h2>
+            <div id="transcript">
+                {% if utterances %}
+                    {% for u in utterances[:500] %}
+                    <div class="utterance" data-start="{{ u.start_ms }}" data-end="{{ u.end_ms }}">
+                        <span class="utterance-time">{{ '%02d:%02d:%02d'|format(u.start_ms // 3600000, (u.start_ms // 60000) % 60, (u.start_ms // 1000) % 60) }}</span>
+                        <span class="utterance-speaker" style="color: {{ u.speaker_color }};">{{ u.speaker_name }}</span>
+                        <div class="utterance-text">{{ u.text }}</div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <p style="color: #666; padding: 10px;">No transcript available</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <script>
+        const DURATION_MS = {{ duration_ms }};
+        const TIMELINE_DATA = {{ {'duration_ms': duration_ms, 'utterances': utterances, 'events': events, 'action_items': action_items, 'speaker_lanes': speaker_lanes, 'speaker_colors': speaker_colors, 'source_tracks': source_tracks, 'people_names': people_names}|tojson }};
+        let zoom = 1;
+        let currentTime = 0;
+
+        function formatTime(ms) {
+            const seconds = Math.floor(ms / 1000);
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+        }
+
+        function updateTimeAxis() {
+            const axis = document.getElementById('timeAxis');
+            const timeline = document.getElementById('timeline');
+            const width = timeline.offsetWidth - 130;
+            const interval = Math.max(60000, Math.floor(DURATION_MS / (width / 100)));
+            axis.innerHTML = '';
+            for (let t = 0; t <= DURATION_MS; t += interval) {
+                const label = document.createElement('div');
+                label.className = 'time-label';
+                label.style.left = (130 + (t / DURATION_MS) * width) + 'px';
+                label.textContent = formatTime(t);
+                axis.appendChild(label);
+            }
+        }
+
+        function zoomIn() {
+            zoom *= 1.5;
+            document.getElementById('timeline').style.width = (zoom * 100) + '%';
+            updateTimeAxis();
+        }
+
+        function zoomOut() {
+            zoom = Math.max(1, zoom / 1.5);
+            document.getElementById('timeline').style.width = (zoom * 100) + '%';
+            updateTimeAxis();
+        }
+
+        function resetZoom() {
+            zoom = 1;
+            document.getElementById('timeline').style.width = '100%';
+            updateTimeAxis();
+        }
+
+        function seekTo(ms) {
+            currentTime = ms;
+            document.getElementById('timeDisplay').textContent = formatTime(ms);
+
+            const playhead = document.getElementById('playhead');
+            const timeline = document.getElementById('timeline');
+            const width = timeline.offsetWidth - 130;
+            playhead.style.display = 'block';
+            playhead.style.left = (130 + (ms / DURATION_MS) * width) + 'px';
+
+            // Highlight active utterance and scroll to it
+            const utterances = document.querySelectorAll('.utterance');
+            let targetUtterance = null;
+            for (const u of utterances) {
+                const start = parseInt(u.dataset.start);
+                const end = parseInt(u.dataset.end);
+                if (ms >= start && ms < end) {
+                    u.classList.add('active');
+                    targetUtterance = u;
+                } else {
+                    u.classList.remove('active');
+                }
+            }
+            if (targetUtterance) {
+                targetUtterance.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        }
+
+        // Click handlers for utterance blocks
+        document.querySelectorAll('.utterance-block').forEach(el => {
+            el.addEventListener('click', () => {
+                seekTo(parseInt(el.dataset.start));
+            });
+        });
+
+        // Click handlers for transcript utterances
+        document.querySelectorAll('.utterance').forEach(el => {
+            el.addEventListener('click', () => {
+                seekTo(parseInt(el.dataset.start));
+            });
+        });
+
+        // Click on timeline to seek
+        document.getElementById('timelineContainer').addEventListener('click', (e) => {
+            if (e.target.closest('.event-marker') || e.target.closest('.action-marker') ||
+                e.target.closest('.utterance-block') || e.target.closest('.source-coverage')) return;
+
+            const timeline = document.getElementById('timeline');
+            const rect = timeline.getBoundingClientRect();
+            const x = e.clientX - rect.left - 130;
+            if (x < 0) return;
+            const width = timeline.offsetWidth - 130;
+            const time = (x / width) * DURATION_MS;
+            seekTo(Math.max(0, Math.min(DURATION_MS, Math.floor(time))));
+        });
+
+        // Initialize
+        updateTimeAxis();
+        window.addEventListener('resize', updateTimeAxis);
+    </script>
+</body>
+</html>
