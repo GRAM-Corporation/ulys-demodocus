@@ -5,7 +5,9 @@ from enum import Enum
 from typing import Optional
 import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from gram_deploy.models.base import GRAMModel, utc_now
 
 
 class EventType(str, Enum):
@@ -37,7 +39,7 @@ class ExtractionMethod(str, Enum):
     IMPORTED = "imported"
 
 
-class DeploymentEvent(BaseModel):
+class DeploymentEvent(GRAMModel):
     """A significant event on the deployment timeline.
 
     ID format: event:{deployment_id}/{uuid}
@@ -46,9 +48,9 @@ class DeploymentEvent(BaseModel):
     id: str = Field(..., pattern=r"^event:.+$")
     deployment_id: str
     event_type: EventType
-    canonical_time_ms: int = Field(..., description="When the event occurred")
+    canonical_time_ms: int = Field(..., ge=0, description="When the event occurred")
     duration_ms: Optional[int] = Field(
-        None, description="Duration if event spans time, None for point events"
+        None, ge=0, description="Duration if event spans time, None for point events"
     )
     title: str = Field(..., max_length=200)
     description: Optional[str] = None
@@ -59,8 +61,8 @@ class DeploymentEvent(BaseModel):
     extraction_method: ExtractionMethod = Field(default=ExtractionMethod.LLM_EXTRACTED)
     confidence: float = Field(0.0, ge=0.0, le=1.0)
     verified: bool = Field(default=False)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     # Additional metadata
     phase: Optional[str] = Field(None, description="Deployment phase this event belongs to")

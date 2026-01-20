@@ -4,22 +4,31 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import Field, model_validator
+
+from gram_deploy.models.base import GRAMModel, utc_now
 
 
-class TimelineSegment(BaseModel):
+class TimelineSegment(GRAMModel):
     """A contiguous period of recording from a source.
 
     Used for timeline visualization to show coverage.
     """
 
     source_id: str
-    canonical_start_ms: int
-    canonical_end_ms: int
-    file_index: int = Field(..., description="Index into the source's files array")
+    canonical_start_ms: int = Field(..., ge=0)
+    canonical_end_ms: int = Field(..., ge=0)
+    file_index: int = Field(..., ge=0, description="Index into the source's files array")
     gap_before_ms: Optional[int] = Field(
-        None, description="Duration of gap before this segment, None if first"
+        None, ge=0, description="Duration of gap before this segment, None if first"
     )
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "TimelineSegment":
+        """Ensure canonical_start_ms <= canonical_end_ms."""
+        if self.canonical_start_ms > self.canonical_end_ms:
+            raise ValueError("canonical_start_ms must be <= canonical_end_ms")
+        return self
 
     @property
     def duration_ms(self) -> int:
@@ -48,7 +57,7 @@ class CrossCorrelation:
     method: str
 
 
-class TimeAlignment(BaseModel):
+class TimeAlignment(GRAMModel):
     """Complete time alignment for a deployment.
 
     Maps all sources to a canonical timeline.
@@ -76,10 +85,18 @@ class TimeAlignment(BaseModel):
     )
 
     # Metadata
-    computed_at: datetime = Field(default_factory=datetime.utcnow)
+    computed_at: datetime = Field(default_factory=utc_now)
     issues: list[str] = Field(
         default_factory=list, description="Alignment issues or warnings"
     )
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "TimeAlignment":
+        """Ensure canonical_start_time <= canonical_end_time if both are set."""
+        if self.canonical_start_time and self.canonical_end_time:
+            if self.canonical_start_time > self.canonical_end_time:
+                raise ValueError("canonical_start_time must be <= canonical_end_time")
+        return self
 
     def get_offset(self, source_id: str) -> int:
         """Get the canonical offset for a source."""

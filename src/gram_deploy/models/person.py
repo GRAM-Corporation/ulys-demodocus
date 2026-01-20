@@ -4,19 +4,28 @@ from datetime import datetime
 from typing import Optional
 import re
 
-from pydantic import BaseModel, Field
+from pydantic import Field, model_validator
+
+from gram_deploy.models.base import GRAMModel, utc_now
 
 
-class VoiceSample(BaseModel):
+class VoiceSample(GRAMModel):
     """A reference audio sample for voice matching."""
 
     source_id: str
-    start_time: float = Field(..., description="Start time in source-local seconds")
-    end_time: float = Field(..., description="End time in source-local seconds")
+    start_time: float = Field(..., ge=0, description="Start time in source-local seconds")
+    end_time: float = Field(..., ge=0, description="End time in source-local seconds")
     verified: bool = Field(default=False, description="Whether a human verified this sample")
 
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "VoiceSample":
+        """Ensure start_time <= end_time."""
+        if self.start_time > self.end_time:
+            raise ValueError("start_time must be <= end_time")
+        return self
 
-class Person(BaseModel):
+
+class Person(GRAMModel):
     """A known team member for speaker identification.
 
     ID format: person:{slug}
@@ -31,8 +40,8 @@ class Person(BaseModel):
     voice_embedding: Optional[list[float]] = Field(
         None, description="Computed voice embedding for speaker identification"
     )
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     @classmethod
     def generate_id(cls, name: str) -> str:
