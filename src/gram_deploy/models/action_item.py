@@ -5,7 +5,9 @@ from enum import Enum
 from typing import Optional
 import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from gram_deploy.models.base import GRAMModel, utc_now
 
 
 class ActionItemStatus(str, Enum):
@@ -25,7 +27,7 @@ class Priority(str, Enum):
     CRITICAL = "critical"
 
 
-class ActionItem(BaseModel):
+class ActionItem(GRAMModel):
     """A task or follow-up extracted from deployment dialogue.
 
     ID format: action:{deployment_id}/{uuid}
@@ -35,7 +37,7 @@ class ActionItem(BaseModel):
     deployment_id: str
     description: str = Field(..., description="What needs to be done (imperative form)")
     source_utterance_id: str = Field(..., description="Utterance where this was mentioned")
-    canonical_time_ms: int = Field(..., description="When this was mentioned")
+    canonical_time_ms: int = Field(..., ge=0, description="When this was mentioned")
     mentioned_by: Optional[str] = Field(None, description="Person ID who mentioned it")
     assigned_to: Optional[str] = Field(None, description="Person ID if assignee was stated")
     deadline: Optional[datetime] = Field(None, description="Deadline if one was stated")
@@ -43,8 +45,8 @@ class ActionItem(BaseModel):
     status: ActionItemStatus = Field(default=ActionItemStatus.EXTRACTED)
     extraction_confidence: float = Field(0.0, ge=0.0, le=1.0)
     verified: bool = Field(default=False)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     # Context
     context_quote: Optional[str] = Field(

@@ -5,7 +5,9 @@ from enum import Enum
 from typing import Optional
 import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import Field, model_validator
+
+from gram_deploy.models.base import GRAMModel, utc_now
 
 
 class InsightType(str, Enum):
@@ -20,21 +22,33 @@ class InsightType(str, Enum):
     CUSTOM = "custom"
 
 
-class SupportingEvidence(BaseModel):
+class SupportingEvidence(GRAMModel):
     """Evidence supporting an insight."""
 
     utterance_id: str
     quote: str
 
 
-class TimeRange(BaseModel):
+class TimeRange(GRAMModel):
     """A time range in canonical milliseconds."""
 
-    start_ms: int
-    end_ms: int
+    start_ms: int = Field(..., ge=0)
+    end_ms: int = Field(..., ge=0)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "TimeRange":
+        """Ensure start_ms <= end_ms."""
+        if self.start_ms > self.end_ms:
+            raise ValueError("start_ms must be <= end_ms")
+        return self
+
+    @property
+    def duration_ms(self) -> int:
+        """Duration of this range in milliseconds."""
+        return self.end_ms - self.start_ms
 
 
-class DeploymentInsight(BaseModel):
+class DeploymentInsight(GRAMModel):
     """A semantic observation extracted from deployment content.
 
     ID format: insight:{deployment_id}/{uuid}
@@ -50,7 +64,7 @@ class DeploymentInsight(BaseModel):
     )
     confidence: float = Field(0.0, ge=0.0, le=1.0)
     verified: bool = Field(default=False)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
     # Additional metadata
     category: Optional[str] = None

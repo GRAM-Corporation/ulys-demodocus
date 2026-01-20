@@ -4,7 +4,9 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import Field, model_validator
+
+from gram_deploy.models.base import GRAMModel, utc_now
 
 
 class DeviceType(str, Enum):
@@ -24,13 +26,13 @@ class TranscriptStatus(str, Enum):
     FAILED = "failed"
 
 
-class SourceFile(BaseModel):
+class SourceFile(GRAMModel):
     """A single video file within a source."""
 
     filename: str
     file_path: str
     file_size_bytes: Optional[int] = None
-    duration_seconds: float
+    duration_seconds: float = Field(..., ge=0)
     start_offset_ms: int = Field(
         ..., description="Milliseconds from canonical start when this file begins"
     )
@@ -40,15 +42,19 @@ class SourceFile(BaseModel):
     video_codec: Optional[str] = None
     audio_codec: Optional[str] = None
     resolution: Optional[str] = None
-    fps: Optional[float] = None
+    fps: Optional[float] = Field(None, ge=0)
 
-    def model_post_init(self, __context) -> None:
-        """Compute end_offset if not set."""
+    @model_validator(mode="after")
+    def validate_and_compute_end_offset(self) -> "SourceFile":
+        """Compute end_offset if not set and validate time range."""
         if self.end_offset_ms is None:
             self.end_offset_ms = self.start_offset_ms + int(self.duration_seconds * 1000)
+        elif self.end_offset_ms < self.start_offset_ms:
+            raise ValueError("end_offset_ms must be >= start_offset_ms")
+        return self
 
 
-class Source(BaseModel):
+class Source(GRAMModel):
     """A video recording source (camera) and its files.
 
     ID format: source:{deployment_id}/{device_type}_{device_number}
@@ -62,7 +68,7 @@ class Source(BaseModel):
     device_model: Optional[str] = Field(None, description="Specific model, e.g., 'GoPro Hero 12'")
     operator: Optional[str] = Field(None, description="Person ID of camera operator")
     files: list[SourceFile] = Field(default_factory=list)
-    total_duration_seconds: Optional[float] = None
+    total_duration_seconds: Optional[float] = Field(None, ge=0)
     canonical_offset_ms: int = Field(
         0, description="Milliseconds to add to source-local time to get canonical time"
     )
@@ -74,8 +80,8 @@ class Source(BaseModel):
         description="How alignment was determined: audio_fingerprint, visual_sync, metadata, manual, unaligned"
     )
     transcript_status: TranscriptStatus = Field(default=TranscriptStatus.PENDING)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     @classmethod
     def generate_id(cls, deployment_id: str, device_type: DeviceType, device_number: int) -> str:

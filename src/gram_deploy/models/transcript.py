@@ -3,34 +3,50 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import Field, model_validator
+
+from gram_deploy.models.base import GRAMModel, utc_now
 
 
-class WordTiming(BaseModel):
+class WordTiming(GRAMModel):
     """Word-level timing information."""
 
     text: str
-    start_time: float = Field(..., description="Start time in seconds from source beginning")
-    end_time: float = Field(..., description="End time in seconds from source beginning")
+    start_time: float = Field(..., ge=0, description="Start time in seconds from source beginning")
+    end_time: float = Field(..., ge=0, description="End time in seconds from source beginning")
     confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
 
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "WordTiming":
+        """Ensure start_time <= end_time."""
+        if self.start_time > self.end_time:
+            raise ValueError("start_time must be <= end_time")
+        return self
 
-class TranscriptSpeaker(BaseModel):
+
+class TranscriptSpeaker(GRAMModel):
     """Speaker identification from transcription service."""
 
     id: str = Field(..., description="Service-assigned speaker ID")
     name: Optional[str] = Field(None, description="Service-assigned speaker name if available")
 
 
-class TranscriptSegment(BaseModel):
+class TranscriptSegment(GRAMModel):
     """A segment of transcribed speech."""
 
     text: str
-    start_time: float = Field(..., description="Start time in seconds from source beginning")
-    end_time: float = Field(..., description="End time in seconds from source beginning")
+    start_time: float = Field(..., ge=0, description="Start time in seconds from source beginning")
+    end_time: float = Field(..., ge=0, description="End time in seconds from source beginning")
     speaker: Optional[TranscriptSpeaker] = None
     confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
     words: Optional[list[WordTiming]] = None
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "TranscriptSegment":
+        """Ensure start_time <= end_time."""
+        if self.start_time > self.end_time:
+            raise ValueError("start_time must be <= end_time")
+        return self
 
     @property
     def duration_seconds(self) -> float:
@@ -38,7 +54,7 @@ class TranscriptSegment(BaseModel):
         return self.end_time - self.start_time
 
 
-class RawTranscript(BaseModel):
+class RawTranscript(GRAMModel):
     """Unprocessed transcript from a transcription service.
 
     Preserves the original data before merging or speaker resolution.
@@ -54,11 +70,11 @@ class RawTranscript(BaseModel):
     )
     transcription_model: Optional[str] = None
     segments: list[TranscriptSegment] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
     # Metadata from the transcription response
-    audio_duration_seconds: Optional[float] = None
-    word_count: Optional[int] = None
+    audio_duration_seconds: Optional[float] = Field(None, ge=0)
+    word_count: Optional[int] = Field(None, ge=0)
 
     @classmethod
     def generate_id(cls, source_id: str) -> str:

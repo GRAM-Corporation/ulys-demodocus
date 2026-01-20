@@ -3,7 +3,9 @@
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from gram_deploy.models.base import GRAMModel
 
 
 class ResolutionMethod(str, Enum):
@@ -14,7 +16,7 @@ class ResolutionMethod(str, Enum):
     UNRESOLVED = "unresolved"
 
 
-class SpeakerMapping(BaseModel):
+class SpeakerMapping(GRAMModel):
     """Maps a raw speaker ID from transcription to a resolved Person.
 
     Used to maintain consistent speaker identity across sources.
