@@ -1,0 +1,15 @@
+{
+  "id": "deploy:20250119_vinci_01",
+  "location": "Vinci",
+  "date": "2025-01-19",
+  "canonical_start_time": null,
+  "canonical_end_time": null,
+  "sources": ["source:deploy:20250119_vinci_01/gopro_01"],
+  "team_members": ["person:damion", "person:chu"],
+  "notes": "Initial test deployment at Vinci facility. Contains footage about Starlink battery levels, storage limitations, and team coordination.",
+  "status": "ingesting",
+  "checkpoint": null,
+  "error_message": null,
+  "created_at": "2025-01-19T00:00:00Z",
+  "updated_at": "2025-01-19T00:00:00Z"
+}
