@@ -14,7 +14,17 @@ from typing import Optional
 import json
 import numpy as np
 
-from gram_deploy.models import RawTranscript, Source, TimeAlignment
+from gram_deploy.models import Deployment, RawTranscript, Source, TimeAlignment
+
+
+@dataclass
+class AlignmentResult:
+    """Result of aligning a single source to the canonical timeline."""
+
+    source_id: str
+    canonical_offset_ms: int
+    confidence: float
+    method: str  # audio_fingerprint, transcript_match, metadata, single_source, unaligned
 
 
 @dataclass
@@ -30,14 +40,176 @@ class AlignmentIssue:
 class TimeAlignmentService:
     """Synchronizes multiple video sources to a canonical timeline."""
 
-    def __init__(self, cache_dir: str):
+    def __init__(self, cache_dir: str, data_dir: Optional[str] = None):
         """Initialize the alignment service.
 
         Args:
             cache_dir: Directory for caching alignment computations
+            data_dir: Root directory for deployment data (for loading sources/transcripts)
         """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir = Path(data_dir) if data_dir else None
+
+    def align_sources(self, deployment: Deployment) -> dict[str, AlignmentResult]:
+        """Align all sources in a deployment to a canonical timeline.
+
+        This is the main entry point for aligning sources. It:
+        1. Loads all sources for the deployment
+        2. Loads any available transcripts
+        3. Loads audio fingerprints if available
+        4. Computes alignment using the best available method
+        5. Returns alignment results for each source
+
+        Args:
+            deployment: The Deployment entity to align
+
+        Returns:
+            Dictionary mapping source_id to AlignmentResult
+        """
+        if self.data_dir is None:
+            raise ValueError("data_dir must be set to use align_sources")
+
+        # Load sources
+        sources = self._load_sources(deployment)
+        if not sources:
+            return {}
+
+        # Load transcripts if available
+        transcripts = self._load_transcripts(deployment, sources)
+
+        # Load audio fingerprints if available
+        fingerprints = self._load_fingerprints(deployment, sources)
+
+        # Compute alignment
+        alignment = self.compute_alignment(sources, transcripts, fingerprints)
+
+        # Apply alignment to sources (updates source objects)
+        self.apply_alignment(alignment, sources)
+
+        # Save sources with updated alignment info
+        self._save_sources(deployment, sources)
+
+        # Update deployment with canonical times
+        self._update_deployment_times(deployment, alignment)
+
+        # Save alignment to disk
+        alignment_path = self._get_alignment_path(deployment)
+        self.save_alignment(alignment, str(alignment_path))
+
+        # Convert to AlignmentResult dict
+        results: dict[str, AlignmentResult] = {}
+        for source_id in alignment.source_offsets:
+            results[source_id] = AlignmentResult(
+                source_id=source_id,
+                canonical_offset_ms=alignment.source_offsets[source_id],
+                confidence=alignment.confidence_scores.get(source_id, 0.0),
+                method=alignment.alignment_methods.get(source_id, "unaligned"),
+            )
+
+        return results
+
+    def _load_sources(self, deployment: Deployment) -> list[Source]:
+        """Load all sources for a deployment from disk."""
+        sources = []
+        for source_id in deployment.sources:
+            source_path = self._get_source_path(deployment, source_id)
+            if source_path.exists():
+                data = json.loads(source_path.read_text())
+                sources.append(Source.model_validate(data))
+        return sources
+
+    def _load_transcripts(
+        self, deployment: Deployment, sources: list[Source]
+    ) -> list[RawTranscript]:
+        """Load all available transcripts for sources."""
+        transcripts = []
+        for source in sources:
+            transcript_path = self._get_transcript_path(deployment, source.id)
+            if transcript_path.exists():
+                data = json.loads(transcript_path.read_text())
+                transcripts.append(RawTranscript.model_validate(data))
+        return transcripts
+
+    def _load_fingerprints(
+        self, deployment: Deployment, sources: list[Source]
+    ) -> Optional[dict[str, bytes]]:
+        """Load audio fingerprints if available."""
+        fingerprints: dict[str, bytes] = {}
+        for source in sources:
+            fp_path = self._get_fingerprint_path(deployment, source.id)
+            if fp_path.exists():
+                fingerprints[source.id] = fp_path.read_bytes()
+        return fingerprints if fingerprints else None
+
+    def _save_sources(self, deployment: Deployment, sources: list[Source]) -> None:
+        """Save updated sources to disk."""
+        for source in sources:
+            source_path = self._get_source_path(deployment, source.id)
+            source_path.write_text(source.model_dump_json(indent=2))
+
+    def _update_deployment_times(
+        self, deployment: Deployment, alignment: TimeAlignment
+    ) -> None:
+        """Update deployment with canonical start/end times."""
+        deployment.canonical_start_time = alignment.canonical_start_time
+        deployment.canonical_end_time = alignment.canonical_end_time
+
+    def _get_deployment_dir(self, deployment: Deployment) -> Path:
+        """Get the directory path for a deployment."""
+        dir_name = deployment.id.replace(":", "_")
+        return self.data_dir / dir_name
+
+    def _get_source_path(self, deployment: Deployment, source_id: str) -> Path:
+        """Get path to source.json for a source."""
+        # source:deploy:20250119_vinci_01/gopro_01 -> gopro_01
+        device_part = source_id.split("/")[-1]
+        return self._get_deployment_dir(deployment) / "sources" / device_part / "source.json"
+
+    def _get_transcript_path(self, deployment: Deployment, source_id: str) -> Path:
+        """Get path to raw_transcript.json for a source."""
+        device_part = source_id.split("/")[-1]
+        return self._get_deployment_dir(deployment) / "sources" / device_part / "raw_transcript.json"
+
+    def _get_fingerprint_path(self, deployment: Deployment, source_id: str) -> Path:
+        """Get path to audio fingerprint file for a source."""
+        device_part = source_id.split("/")[-1]
+        return self._get_deployment_dir(deployment) / "cache" / "alignment" / f"{device_part}.fingerprint"
+
+    def _get_alignment_path(self, deployment: Deployment) -> Path:
+        """Get path to alignment.json for a deployment."""
+        return self._get_deployment_dir(deployment) / "canonical" / "alignment.json"
+
+    def calculate_canonical_timeline(
+        self, alignment: TimeAlignment, sources: list[Source]
+    ) -> TimeAlignment:
+        """Calculate and set canonical timeline bounds from alignment.
+
+        Determines the canonical start time (earliest source) and end time
+        (latest source end). Updates source_offsets so all times are relative
+        to the canonical start.
+
+        Args:
+            alignment: TimeAlignment with computed offsets
+            sources: List of aligned sources
+
+        Returns:
+            Updated TimeAlignment with normalized offsets
+        """
+        if not sources or not alignment.source_offsets:
+            return alignment
+
+        # Find minimum offset to normalize all offsets
+        min_offset = min(alignment.source_offsets.values())
+
+        # Normalize offsets so earliest source starts at 0
+        for source_id in alignment.source_offsets:
+            alignment.source_offsets[source_id] -= min_offset
+
+        # Compute canonical end time
+        alignment.canonical_end_time = self._compute_end_time(sources, alignment)
+
+        return alignment
 
     def compute_alignment(
         self,
@@ -216,7 +388,9 @@ class TimeAlignmentService:
 
             if confidence >= 0.5:
                 alignment.source_offsets[source.id] = offset
-                alignment.confidence_scores[source.id] = confidence
+                # Scale confidence to 0.9-1.0 range per spec
+                scaled_confidence = 0.9 + (confidence * 0.1)
+                alignment.confidence_scores[source.id] = min(scaled_confidence, 1.0)
                 alignment.alignment_methods[source.id] = "audio_fingerprint"
                 alignment.cross_correlations.append({
                     "source_a": ref_source.id,
@@ -330,9 +504,11 @@ class TimeAlignmentService:
         # Use median offset from matches
         offsets = [m[0] for m in matches]
         median_offset = int(np.median(offsets))
-        confidence = len(matches) / max(len(phrases_a), 1) * 0.5 + 0.5
+        # Scale confidence to 0.7-0.9 range per spec for transcript matching
+        raw_confidence = len(matches) / max(len(phrases_a), 1)
+        confidence = 0.7 + (raw_confidence * 0.2)
 
-        return median_offset, min(confidence, 1.0)
+        return median_offset, min(confidence, 0.9)
 
     def _text_similarity(self, text_a: str, text_b: str) -> float:
         """Compute similarity between two text strings."""
@@ -366,12 +542,16 @@ class TimeAlignmentService:
                     offset_ms = int((start - canonical_start.timestamp()) * 1000)
 
                     alignment.source_offsets[source.id] = offset_ms
-                    alignment.confidence_scores[source.id] = 0.3
+                    # Confidence 0.3-0.5 per spec based on file count and metadata quality
+                    # More files with consistent timestamps = higher confidence
+                    file_count = len(source.files)
+                    confidence = min(0.3 + (file_count * 0.05), 0.5)
+                    alignment.confidence_scores[source.id] = confidence
                     alignment.alignment_methods[source.id] = "metadata"
                 else:
                     # No metadata available, assume zero offset
                     alignment.source_offsets[source.id] = 0
-                    alignment.confidence_scores[source.id] = 0.1
+                    alignment.confidence_scores[source.id] = 0.3  # Minimum per spec
                     alignment.alignment_methods[source.id] = "unaligned"
 
     def _find_transcript_matches(
