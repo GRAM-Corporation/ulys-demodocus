@@ -65,6 +65,16 @@ class Settings(BaseSettings):
         validation_alias="GRAM_SPEAKER_THRESHOLD"
     )
 
+    # S3 settings for presigned URL transcription
+    s3_bucket: str | None = Field(
+        default=None,
+        validation_alias="GRAM_S3_BUCKET"
+    )
+    s3_region: str = Field(
+        default="us-east-1",
+        validation_alias="AWS_REGION"
+    )
+
     # Search settings
     search_db_path: Path | None = Field(
         default=None,

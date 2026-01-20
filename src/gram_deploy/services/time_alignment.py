@@ -1,20 +1,45 @@
 """Time Alignment Service - synchronizes multiple sources to a canonical timeline.
 
 Responsible for:
-- Computing time offsets between sources using audio fingerprints
-- Fallback alignment using transcript matching
-- Metadata-based alignment as last resort
+- Computing time offsets between sources using transcript matching
+- Fallback alignment using file metadata
 - Verification of alignment quality
 """
 
+import json
+import statistics
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-import json
-import numpy as np
 
-from gram_deploy.models import RawTranscript, Source, TimeAlignment
+from pydantic import BaseModel, Field
+
+from gram_deploy.models import Deployment, RawTranscript, Source
+
+
+class AlignmentResult(BaseModel):
+    """Result of aligning a single source to the canonical timeline."""
+
+    source_id: str
+    canonical_offset_ms: int = Field(
+        ..., description="Milliseconds to add to source-local time to get canonical time"
+    )
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Alignment confidence")
+    method: str = Field(
+        ..., description="Alignment method: transcript, metadata, or single_source"
+    )
+    match_count: int = Field(
+        default=0, ge=0, description="Number of matching phrases found (for transcript method)"
+    )
+
+
+@dataclass
+class Match:
+    """A matching phrase between two transcripts."""
+
+    offset_ms: int
+    similarity: float
 
 
 @dataclass
@@ -28,383 +53,694 @@ class AlignmentIssue:
 
 
 class TimeAlignmentService:
-    """Synchronizes multiple video sources to a canonical timeline."""
+    """Synchronizes multiple video sources to a canonical timeline.
 
-    def __init__(self, cache_dir: str):
+    Primary method is transcript-based alignment using overlapping speech
+    patterns to compute time offsets between sources.
+    """
+
+    def __init__(self, data_dir: str):
         """Initialize the alignment service.
 
         Args:
-            cache_dir: Directory for caching alignment computations
+            data_dir: Root data directory (e.g., ./deployments)
         """
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir = Path(data_dir)
 
-    def compute_alignment(
+    def align_sources(
         self,
-        sources: list[Source],
-        transcripts: list[RawTranscript],
-        audio_fingerprints: Optional[dict[str, bytes]] = None,
-    ) -> TimeAlignment:
-        """Compute time alignment for all sources.
+        deployment: Deployment,
+        sources: Optional[list[Source]] = None,
+        transcripts: Optional[list[RawTranscript]] = None,
+    ) -> dict[str, AlignmentResult]:
+        """Compute time alignment for all sources in a deployment.
 
         Args:
-            sources: List of Source entities
-            transcripts: Corresponding RawTranscript entities
-            audio_fingerprints: Optional pre-computed fingerprints {source_id: fingerprint}
+            deployment: The Deployment entity
+            sources: Optional list of Source entities (loaded from disk if not provided)
+            transcripts: Optional list of RawTranscript entities (loaded from disk if not provided)
 
         Returns:
-            TimeAlignment with offsets for each source
+            Dictionary mapping source_id to AlignmentResult
         """
+        # Load sources if not provided
+        if sources is None:
+            sources = self._load_sources(deployment)
+
         if not sources:
-            raise ValueError("At least one source is required")
+            return {}
 
-        # Find earliest recording start as canonical zero
-        canonical_start = self._find_earliest_start(sources)
-
-        # Initialize alignment
-        alignment = TimeAlignment(
-            deployment_id=sources[0].deployment_id,
-            canonical_start_time=canonical_start,
-            source_offsets={},
-            confidence_scores={},
-            alignment_methods={},
-            cross_correlations=[],
-        )
-
-        # Single source: trivial alignment
+        # Handle single source case
         if len(sources) == 1:
             source = sources[0]
-            alignment.source_offsets[source.id] = 0
-            alignment.confidence_scores[source.id] = 1.0
-            alignment.alignment_methods[source.id] = "single_source"
-            return alignment
+            return {
+                source.id: AlignmentResult(
+                    source_id=source.id,
+                    canonical_offset_ms=0,
+                    confidence=1.0,
+                    method="single_source",
+                    match_count=0,
+                )
+            }
 
-        # Try audio fingerprint alignment first
-        if audio_fingerprints:
-            self._align_by_audio(sources, audio_fingerprints, alignment)
+        # Load transcripts if not provided
+        if transcripts is None:
+            transcripts = self._load_transcripts(deployment, sources)
 
-        # Use transcript matching for sources not yet aligned
-        unaligned = [s for s in sources if s.id not in alignment.source_offsets]
-        if unaligned and transcripts:
-            transcript_map = {t.source_id: t for t in transcripts}
-            self._align_by_transcript(unaligned, transcript_map, alignment)
+        # Build transcript map
+        transcript_map = {t.source_id: t for t in transcripts}
 
-        # Fallback to metadata for remaining sources
-        still_unaligned = [s for s in sources if s.id not in alignment.source_offsets]
-        if still_unaligned:
-            self._align_by_metadata(still_unaligned, canonical_start, alignment)
-
-        # Compute canonical end time
-        alignment.canonical_end_time = self._compute_end_time(sources, alignment)
-
-        return alignment
-
-    def apply_alignment(self, alignment: TimeAlignment, sources: list[Source]) -> None:
-        """Apply computed alignment to sources.
-
-        Args:
-            alignment: The computed TimeAlignment
-            sources: Sources to update with alignment data
-        """
-        for source in sources:
-            if source.id in alignment.source_offsets:
-                source.canonical_offset_ms = alignment.source_offsets[source.id]
-                source.alignment_confidence = alignment.confidence_scores.get(source.id, 0.0)
-                source.alignment_method = alignment.alignment_methods.get(source.id, "unknown")
-
-    def verify_alignment(
-        self,
-        alignment: TimeAlignment,
-        transcripts: list[RawTranscript],
-        tolerance_ms: int = 2000,
-    ) -> list[AlignmentIssue]:
-        """Verify alignment quality by checking transcript consistency.
-
-        Args:
-            alignment: The TimeAlignment to verify
-            transcripts: Transcripts to check for consistency
-            tolerance_ms: Maximum acceptable time difference for matching text
-
-        Returns:
-            List of alignment issues found
-        """
-        issues: list[AlignmentIssue] = []
-
-        # Find matching text across transcripts
-        matches = self._find_transcript_matches(transcripts)
-
-        for match in matches:
-            source_a, source_b, text, time_a, time_b = match
-
-            # Convert to canonical time
-            canonical_a = time_a * 1000 + alignment.get_offset(source_a)
-            canonical_b = time_b * 1000 + alignment.get_offset(source_b)
-
-            diff = abs(canonical_a - canonical_b)
-            if diff > tolerance_ms:
-                issues.append(AlignmentIssue(
-                    source_id=source_b,
-                    description=f"Text '{text[:50]}...' differs by {diff}ms from {source_a}",
-                    severity="warning" if diff < tolerance_ms * 2 else "error",
-                    suggested_fix=f"Adjust offset by {canonical_a - canonical_b}ms",
-                ))
-
-        return issues
-
-    def _find_earliest_start(self, sources: list[Source]) -> datetime:
-        """Find the earliest recording start time across sources."""
-        # Try to extract from file metadata
-        earliest = datetime.utcnow()
-
-        for source in sources:
-            if source.files:
-                # Use file creation time as approximation
-                for f in source.files:
-                    path = Path(f.file_path)
-                    if path.exists():
-                        mtime = datetime.fromtimestamp(path.stat().st_mtime)
-                        # Subtract duration to get start time
-                        start = mtime.timestamp() - f.duration_seconds
-                        file_start = datetime.fromtimestamp(start)
-                        if file_start < earliest:
-                            earliest = file_start
-
-        return earliest
-
-    def _compute_end_time(
-        self,
-        sources: list[Source],
-        alignment: TimeAlignment,
-    ) -> datetime:
-        """Compute the canonical end time from aligned sources."""
-        max_end_ms = 0
-
-        for source in sources:
-            offset = alignment.get_offset(source.id)
-            source_end_ms = int(source.total_duration * 1000) + offset
-            max_end_ms = max(max_end_ms, source_end_ms)
-
-        return datetime.fromtimestamp(
-            alignment.canonical_start_time.timestamp() + max_end_ms / 1000
-        )
-
-    def _align_by_audio(
-        self,
-        sources: list[Source],
-        fingerprints: dict[str, bytes],
-        alignment: TimeAlignment,
-    ) -> None:
-        """Align sources using audio fingerprint cross-correlation."""
         # Use first source as reference
-        ref_source = sources[0]
-        ref_fp = fingerprints.get(ref_source.id)
+        reference_source = sources[0]
+        results: dict[str, AlignmentResult] = {
+            reference_source.id: AlignmentResult(
+                source_id=reference_source.id,
+                canonical_offset_ms=0,
+                confidence=1.0,
+                method="transcript",
+                match_count=0,
+            )
+        }
 
-        if not ref_fp:
-            return
-
-        alignment.source_offsets[ref_source.id] = 0
-        alignment.confidence_scores[ref_source.id] = 1.0
-        alignment.alignment_methods[ref_source.id] = "audio_fingerprint"
+        # Align other sources relative to reference
+        reference_transcript = transcript_map.get(reference_source.id)
 
         for source in sources[1:]:
-            source_fp = fingerprints.get(source.id)
-            if not source_fp:
-                continue
+            source_transcript = transcript_map.get(source.id)
 
-            # Cross-correlate fingerprints
-            offset, confidence = self._cross_correlate_fingerprints(ref_fp, source_fp)
+            # Try transcript alignment first
+            if reference_transcript and source_transcript:
+                offset_ms, confidence, match_count = self._align_by_transcript(
+                    reference_transcript, source_transcript
+                )
 
-            if confidence >= 0.5:
-                alignment.source_offsets[source.id] = offset
-                alignment.confidence_scores[source.id] = confidence
-                alignment.alignment_methods[source.id] = "audio_fingerprint"
-                alignment.cross_correlations.append({
-                    "source_a": ref_source.id,
-                    "source_b": source.id,
-                    "offset_ms": offset,
-                    "confidence": confidence,
-                })
+                if confidence >= 0.5:  # Minimum threshold for transcript alignment
+                    results[source.id] = AlignmentResult(
+                        source_id=source.id,
+                        canonical_offset_ms=offset_ms,
+                        confidence=confidence,
+                        method="transcript",
+                        match_count=match_count,
+                    )
+                    continue
 
-    def _cross_correlate_fingerprints(
-        self,
-        fp_a: bytes,
-        fp_b: bytes,
-    ) -> tuple[int, float]:
-        """Cross-correlate two audio fingerprints.
+            # Fall back to metadata alignment
+            offset_ms, confidence = self._align_by_metadata(source, reference_source)
+            results[source.id] = AlignmentResult(
+                source_id=source.id,
+                canonical_offset_ms=offset_ms,
+                confidence=confidence,
+                method="metadata",
+                match_count=0,
+            )
 
-        Returns:
-            (offset_ms, confidence) where offset is fp_b - fp_a
-        """
-        try:
-            # Convert fingerprints to numpy arrays
-            arr_a = np.frombuffer(fp_a, dtype=np.int32)
-            arr_b = np.frombuffer(fp_b, dtype=np.int32)
-
-            if len(arr_a) == 0 or len(arr_b) == 0:
-                return 0, 0.0
-
-            # Compute cross-correlation
-            correlation = np.correlate(arr_a, arr_b, mode='full')
-            max_idx = np.argmax(np.abs(correlation))
-
-            # Convert index to time offset (assuming ~100ms per fingerprint unit)
-            offset_units = max_idx - len(arr_b) + 1
-            offset_ms = offset_units * 100
-
-            # Confidence based on correlation peak
-            max_corr = np.abs(correlation[max_idx])
-            auto_corr = np.sqrt(np.sum(arr_a**2) * np.sum(arr_b**2))
-            confidence = max_corr / auto_corr if auto_corr > 0 else 0.0
-
-            return offset_ms, min(confidence, 1.0)
-
-        except Exception:
-            return 0, 0.0
+        return results
 
     def _align_by_transcript(
         self,
-        sources: list[Source],
-        transcripts: dict[str, RawTranscript],
-        alignment: TimeAlignment,
-    ) -> None:
-        """Align sources using matching transcript text."""
-        # Find matching phrases across transcripts
-        for source in sources:
-            transcript = transcripts.get(source.id)
-            if not transcript:
-                continue
+        transcript_a: RawTranscript,
+        transcript_b: RawTranscript,
+    ) -> tuple[int, float, int]:
+        """Align two sources using transcript text matching.
 
-            # Look for matching text in already-aligned sources
-            for aligned_id, offset in alignment.source_offsets.items():
-                aligned_transcript = transcripts.get(aligned_id)
-                if not aligned_transcript:
-                    continue
+        Uses fuzzy matching to find overlapping phrases and compute
+        the time offset between transcripts.
 
-                match_offset, confidence = self._find_text_offset(
-                    transcript, aligned_transcript, offset
-                )
+        Args:
+            transcript_a: Reference transcript (offset = 0)
+            transcript_b: Transcript to align
 
-                if confidence >= 0.4:
-                    alignment.source_offsets[source.id] = match_offset
-                    alignment.confidence_scores[source.id] = confidence
-                    alignment.alignment_methods[source.id] = "transcript_match"
-                    break
+        Returns:
+            (offset_ms, confidence, match_count) where offset is what to add to
+            transcript_b times to get canonical time
+        """
+        # Find matching segments
+        matches = self._find_matches(transcript_a, transcript_b)
 
-    def _find_text_offset(
+        if not matches:
+            return 0, 0.0, 0
+
+        # Single match - lower confidence
+        if len(matches) == 1:
+            return matches[0].offset_ms, self._confidence_for_matches(1), 1
+
+        # Multiple matches - cluster offsets to find consensus
+        offset_ms, confidence = self._calculate_offset_from_matches(matches)
+        return offset_ms, confidence, len(matches)
+
+    def _find_matches(
         self,
         transcript_a: RawTranscript,
         transcript_b: RawTranscript,
-        b_offset: int,
-    ) -> tuple[int, float]:
-        """Find time offset between transcripts by matching text.
+        similarity_threshold: float = 0.85,
+    ) -> list[Match]:
+        """Find matching phrases between two transcripts.
+
+        Args:
+            transcript_a: First transcript (reference)
+            transcript_b: Second transcript
+            similarity_threshold: Minimum similarity for a match (default 0.85)
 
         Returns:
-            (offset_ms for a, confidence)
+            List of Match objects with offset and similarity
         """
-        # Extract significant phrases (5+ words)
-        phrases_a = [
-            (s.text, s.start_time)
-            for s in transcript_a.segments
-            if len(s.text.split()) >= 5
-        ]
-        phrases_b = [
-            (s.text, s.start_time)
-            for s in transcript_b.segments
-            if len(s.text.split()) >= 5
-        ]
+        matches: list[Match] = []
 
-        matches: list[tuple[float, float]] = []
+        for seg_a in transcript_a.segments:
+            # Skip very short segments
+            if len(seg_a.text.split()) < 3:
+                continue
 
-        for text_a, time_a in phrases_a:
-            for text_b, time_b in phrases_b:
-                similarity = self._text_similarity(text_a, text_b)
-                if similarity > 0.8:
-                    # Compute what offset would make these align
-                    canonical_b = time_b * 1000 + b_offset
-                    offset_a = canonical_b - time_a * 1000
-                    matches.append((offset_a, similarity))
+            for seg_b in transcript_b.segments:
+                if len(seg_b.text.split()) < 3:
+                    continue
 
-        if not matches:
-            return 0, 0.0
+                similarity = self._fuzzy_ratio(seg_a.text, seg_b.text)
 
-        # Use median offset from matches
-        offsets = [m[0] for m in matches]
-        median_offset = int(np.median(offsets))
-        confidence = len(matches) / max(len(phrases_a), 1) * 0.5 + 0.5
+                if similarity > similarity_threshold:
+                    # Offset: what to add to B's time to match A's time
+                    # If seg_a is at 1000ms and seg_b is at 500ms,
+                    # then offset = 1000 - 500 = 500ms (add 500ms to B)
+                    offset = int(seg_a.start_time * 1000) - int(seg_b.start_time * 1000)
+                    matches.append(Match(offset_ms=offset, similarity=similarity))
 
-        return median_offset, min(confidence, 1.0)
+        return matches
 
-    def _text_similarity(self, text_a: str, text_b: str) -> float:
-        """Compute similarity between two text strings."""
-        # Simple word overlap similarity
-        words_a = set(text_a.lower().split())
-        words_b = set(text_b.lower().split())
+    def _fuzzy_ratio(self, text_a: str, text_b: str) -> float:
+        """Compute fuzzy similarity ratio between two strings.
+
+        Uses a combination of word overlap (Jaccard) and character-level
+        longest common subsequence ratio.
+
+        Args:
+            text_a: First text
+            text_b: Second text
+
+        Returns:
+            Similarity ratio between 0.0 and 1.0
+        """
+        # Normalize texts
+        a = text_a.lower().strip()
+        b = text_b.lower().strip()
+
+        if not a or not b:
+            return 0.0
+
+        if a == b:
+            return 1.0
+
+        # Word-level Jaccard similarity
+        words_a = set(a.split())
+        words_b = set(b.split())
 
         if not words_a or not words_b:
             return 0.0
 
         intersection = len(words_a & words_b)
         union = len(words_a | words_b)
+        jaccard = intersection / union if union > 0 else 0.0
 
-        return intersection / union if union > 0 else 0.0
+        # Character-level ratio using LCS
+        lcs_length = self._lcs_length(a, b)
+        lcs_ratio = (2.0 * lcs_length) / (len(a) + len(b))
+
+        # Combine both metrics (weight word overlap more heavily)
+        return 0.6 * jaccard + 0.4 * lcs_ratio
+
+    def _lcs_length(self, a: str, b: str) -> int:
+        """Compute length of longest common subsequence.
+
+        Uses space-optimized dynamic programming.
+
+        Args:
+            a: First string
+            b: Second string
+
+        Returns:
+            Length of LCS
+        """
+        if not a or not b:
+            return 0
+
+        # Space optimization: only keep two rows
+        m, n = len(a), len(b)
+        prev = [0] * (n + 1)
+        curr = [0] * (n + 1)
+
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if a[i - 1] == b[j - 1]:
+                    curr[j] = prev[j - 1] + 1
+                else:
+                    curr[j] = max(prev[j], curr[j - 1])
+            prev, curr = curr, [0] * (n + 1)
+
+        return prev[n]
+
+    def _calculate_offset_from_matches(
+        self,
+        matches: list[Match],
+    ) -> tuple[int, float]:
+        """Calculate consensus offset from multiple matches using clustering.
+
+        Groups offsets into clusters and returns the median of the dominant
+        cluster along with a confidence score.
+
+        Args:
+            matches: List of Match objects
+
+        Returns:
+            (offset_ms, confidence)
+        """
+        if not matches:
+            return 0, 0.0
+
+        if len(matches) == 1:
+            return matches[0].offset_ms, self._confidence_for_matches(1)
+
+        offsets = [m.offset_ms for m in matches]
+
+        # Cluster offsets using a simple approach: group by proximity
+        clusters = self._cluster_offsets(offsets, tolerance_ms=2000)
+
+        if not clusters:
+            return 0, 0.0
+
+        # Find the largest cluster
+        largest_cluster = max(clusters, key=len)
+
+        # Use median of largest cluster
+        median_offset = int(statistics.median(largest_cluster))
+
+        # Confidence based on cluster tightness and size
+        confidence = self._compute_cluster_confidence(largest_cluster, len(matches))
+
+        return median_offset, confidence
+
+    def _cluster_offsets(
+        self,
+        offsets: list[int],
+        tolerance_ms: int = 2000,
+    ) -> list[list[int]]:
+        """Cluster offsets by proximity.
+
+        Args:
+            offsets: List of offset values in milliseconds
+            tolerance_ms: Maximum difference to be in same cluster
+
+        Returns:
+            List of clusters, each cluster is a list of offsets
+        """
+        if not offsets:
+            return []
+
+        sorted_offsets = sorted(offsets)
+        clusters: list[list[int]] = [[sorted_offsets[0]]]
+
+        for offset in sorted_offsets[1:]:
+            # Check if offset belongs to current cluster
+            if abs(offset - clusters[-1][-1]) <= tolerance_ms:
+                clusters[-1].append(offset)
+            else:
+                # Start new cluster
+                clusters.append([offset])
+
+        return clusters
+
+    def _compute_cluster_confidence(
+        self,
+        cluster: list[int],
+        total_matches: int,
+    ) -> float:
+        """Compute confidence score for a cluster.
+
+        Args:
+            cluster: List of offsets in the cluster
+            total_matches: Total number of matches
+
+        Returns:
+            Confidence score between 0.0 and 1.0
+        """
+        if not cluster:
+            return 0.0
+
+        cluster_size = len(cluster)
+
+        # Base confidence from match count
+        base_confidence = self._confidence_for_matches(cluster_size)
+
+        # Adjust for cluster tightness (lower std = higher confidence)
+        if cluster_size > 1:
+            try:
+                std_dev = statistics.stdev(cluster)
+                # Tightness bonus: lower std dev -> higher bonus
+                # 0ms std -> +0.05, 1000ms std -> +0, 2000ms+ -> -0.05
+                tightness_bonus = max(-0.05, min(0.05, 0.05 - std_dev / 20000))
+                base_confidence = min(0.95, base_confidence + tightness_bonus)
+            except statistics.StatisticsError:
+                pass
+
+        # Adjust for proportion of matches in cluster
+        proportion = cluster_size / total_matches if total_matches > 0 else 0
+        if proportion < 0.5:
+            # Less than half matches agree - lower confidence
+            base_confidence *= 0.8
+
+        return round(base_confidence, 2)
+
+    def _confidence_for_matches(self, match_count: int) -> float:
+        """Get base confidence level for a given match count.
+
+        Per spec:
+        - 5+ matches: 0.85-0.95
+        - 2-4 matches: 0.7-0.85
+        - 1 match: 0.5-0.7
+
+        Args:
+            match_count: Number of matching phrases
+
+        Returns:
+            Base confidence score
+        """
+        if match_count >= 5:
+            # Scale from 0.85 to 0.95 based on count (5->0.85, 10+->0.95)
+            return min(0.95, 0.85 + (match_count - 5) * 0.02)
+        elif match_count >= 2:
+            # Scale from 0.7 to 0.85 based on count (2->0.7, 4->0.85)
+            return 0.7 + (match_count - 2) * 0.05
+        elif match_count == 1:
+            return 0.6  # Middle of 0.5-0.7 range
+        else:
+            return 0.0
 
     def _align_by_metadata(
         self,
-        sources: list[Source],
-        canonical_start: datetime,
-        alignment: TimeAlignment,
-    ) -> None:
-        """Fallback alignment using file metadata."""
-        for source in sources:
-            if source.files:
-                # Use first file's modification time
-                path = Path(source.files[0].file_path)
-                if path.exists():
-                    mtime = datetime.fromtimestamp(path.stat().st_mtime)
-                    # Estimate start time
-                    start = mtime.timestamp() - source.files[0].duration_seconds
-                    offset_ms = int((start - canonical_start.timestamp()) * 1000)
+        source: Source,
+        reference_source: Optional[Source] = None,
+    ) -> tuple[int, float]:
+        """Fallback alignment using file metadata.
 
-                    alignment.source_offsets[source.id] = offset_ms
-                    alignment.confidence_scores[source.id] = 0.3
-                    alignment.alignment_methods[source.id] = "metadata"
-                else:
-                    # No metadata available, assume zero offset
-                    alignment.source_offsets[source.id] = 0
-                    alignment.confidence_scores[source.id] = 0.1
-                    alignment.alignment_methods[source.id] = "unaligned"
+        Parses video file creation timestamps to calculate offset.
 
-    def _find_transcript_matches(
-        self,
-        transcripts: list[RawTranscript],
-    ) -> list[tuple[str, str, str, float, float]]:
-        """Find matching text across transcripts.
+        Args:
+            source: Source to align
+            reference_source: Reference source (optional, for relative offset)
 
         Returns:
-            List of (source_a, source_b, text, time_a, time_b) tuples
+            (offset_ms, confidence) with confidence in 0.3-0.5 range
         """
-        matches = []
+        source_start = self._get_source_start_time(source)
+        ref_start = self._get_source_start_time(reference_source) if reference_source else None
 
+        if source_start is None:
+            # No metadata available
+            return 0, 0.3
+
+        if ref_start is None:
+            # Have source start but no reference
+            return 0, 0.4
+
+        # Calculate offset relative to reference
+        offset_ms = int((ref_start - source_start) * 1000)
+
+        # Confidence based on whether we got actual timestamps
+        confidence = 0.5 if source_start and ref_start else 0.3
+
+        return offset_ms, confidence
+
+    def _get_source_start_time(self, source: Optional[Source]) -> Optional[float]:
+        """Get estimated start time for a source from file metadata.
+
+        Args:
+            source: Source entity
+
+        Returns:
+            Start time as Unix timestamp, or None if not available
+        """
+        if not source or not source.files:
+            return None
+
+        # Use first file's modification time minus its duration
+        first_file = source.files[0]
+        path = Path(first_file.file_path)
+
+        if not path.exists():
+            return None
+
+        try:
+            mtime = path.stat().st_mtime
+            # Subtract duration to estimate start time
+            return mtime - first_file.duration_seconds
+        except OSError:
+            return None
+
+    def calculate_canonical_timeline(
+        self,
+        deployment: Deployment,
+        alignments: dict[str, AlignmentResult],
+    ) -> None:
+        """Apply alignment results to sources and update deployment timeline.
+
+        Sets canonical_offset_ms on each source and updates the deployment's
+        canonical_start_time and canonical_end_time.
+
+        Args:
+            deployment: Deployment entity to update
+            alignments: Alignment results from align_sources()
+        """
+        # Load sources
+        sources = self._load_sources(deployment)
+
+        if not sources:
+            return
+
+        # Find earliest and latest times across all sources
+        canonical_start: Optional[datetime] = None
+        canonical_end_ms: int = 0
+
+        for source in sources:
+            alignment = alignments.get(source.id)
+            if not alignment:
+                continue
+
+            # Update source with alignment
+            source.canonical_offset_ms = alignment.canonical_offset_ms
+            source.alignment_confidence = alignment.confidence
+            source.alignment_method = alignment.method
+
+            # Calculate source's end in canonical time
+            source_duration_ms = int(source.total_duration * 1000)
+            source_end_canonical = source_duration_ms + alignment.canonical_offset_ms
+            canonical_end_ms = max(canonical_end_ms, source_end_canonical)
+
+            # Save updated source
+            self._save_source(deployment, source)
+
+        # Get canonical start from reference source metadata
+        if sources and sources[0].files:
+            start_time = self._get_source_start_time(sources[0])
+            if start_time:
+                canonical_start = datetime.fromtimestamp(start_time)
+
+        # Update deployment
+        if canonical_start:
+            deployment.canonical_start_time = canonical_start
+            deployment.canonical_end_time = datetime.fromtimestamp(
+                canonical_start.timestamp() + canonical_end_ms / 1000
+            )
+
+    def _load_sources(self, deployment: Deployment) -> list[Source]:
+        """Load all sources for a deployment from disk.
+
+        Args:
+            deployment: The Deployment entity
+
+        Returns:
+            List of Source entities
+        """
+        sources: list[Source] = []
+        deploy_dir = self._get_deployment_dir(deployment.id)
+
+        for source_id in deployment.sources:
+            # Parse source ID to get device part
+            parts = source_id.replace("source:", "").split("/")
+            if len(parts) != 2:
+                continue
+
+            device_part = parts[1]
+            source_path = deploy_dir / "sources" / device_part / "source.json"
+
+            if source_path.exists():
+                data = json.loads(source_path.read_text())
+                sources.append(Source.model_validate(data))
+
+        return sources
+
+    def _load_transcripts(
+        self,
+        deployment: Deployment,
+        sources: list[Source],
+    ) -> list[RawTranscript]:
+        """Load raw transcripts for all sources.
+
+        Args:
+            deployment: The Deployment entity
+            sources: List of Source entities
+
+        Returns:
+            List of RawTranscript entities
+        """
+        transcripts: list[RawTranscript] = []
+        deploy_dir = self._get_deployment_dir(deployment.id)
+
+        for source in sources:
+            # Parse source ID to get device part
+            parts = source.id.replace("source:", "").split("/")
+            if len(parts) != 2:
+                continue
+
+            device_part = parts[1]
+            transcript_path = deploy_dir / "sources" / device_part / "transcript.json"
+
+            if transcript_path.exists():
+                data = json.loads(transcript_path.read_text())
+                transcripts.append(RawTranscript.model_validate(data))
+
+        return transcripts
+
+    def _save_source(self, deployment: Deployment, source: Source) -> None:
+        """Save a source to disk.
+
+        Args:
+            deployment: The Deployment entity
+            source: The Source entity to save
+        """
+        # Parse source ID to get device part
+        parts = source.id.replace("source:", "").split("/")
+        if len(parts) != 2:
+            return
+
+        device_part = parts[1]
+        deploy_dir = self._get_deployment_dir(deployment.id)
+        source_path = deploy_dir / "sources" / device_part / "source.json"
+
+        source_path.write_text(source.model_dump_json(indent=2))
+
+    def _get_deployment_dir(self, deployment_id: str) -> Path:
+        """Get the directory path for a deployment.
+
+        Args:
+            deployment_id: Deployment ID (e.g., deploy:20250119_vinci_01)
+
+        Returns:
+            Path to deployment directory
+        """
+        # Convert deploy:20250119_vinci_01 to deploy_20250119_vinci_01
+        dir_name = deployment_id.replace(":", "_")
+        return self.data_dir / dir_name
+
+    def verify_alignment(
+        self,
+        alignments: dict[str, AlignmentResult],
+        transcripts: list[RawTranscript],
+        tolerance_ms: int = 2000,
+    ) -> list[AlignmentIssue]:
+        """Verify alignment quality by checking transcript consistency.
+
+        Args:
+            alignments: Alignment results
+            transcripts: Transcripts to check
+            tolerance_ms: Maximum acceptable time difference
+
+        Returns:
+            List of alignment issues found
+        """
+        issues: list[AlignmentIssue] = []
+
+        # Find matching text across transcripts and verify times align
         for i, transcript_a in enumerate(transcripts):
             for transcript_b in transcripts[i + 1:]:
+                alignment_a = alignments.get(transcript_a.source_id)
+                alignment_b = alignments.get(transcript_b.source_id)
+
+                if not alignment_a or not alignment_b:
+                    continue
+
+                # Check for matching text
                 for seg_a in transcript_a.segments:
                     for seg_b in transcript_b.segments:
-                        if self._text_similarity(seg_a.text, seg_b.text) > 0.8:
-                            matches.append((
-                                transcript_a.source_id,
-                                transcript_b.source_id,
-                                seg_a.text,
-                                seg_a.start_time,
-                                seg_b.start_time,
-                            ))
+                        similarity = self._fuzzy_ratio(seg_a.text, seg_b.text)
 
-        return matches
+                        if similarity > 0.85:
+                            # Convert to canonical time
+                            canonical_a = (
+                                int(seg_a.start_time * 1000)
+                                + alignment_a.canonical_offset_ms
+                            )
+                            canonical_b = (
+                                int(seg_b.start_time * 1000)
+                                + alignment_b.canonical_offset_ms
+                            )
 
-    def save_alignment(self, alignment: TimeAlignment, path: str) -> None:
-        """Save alignment to disk."""
-        Path(path).write_text(alignment.model_dump_json(indent=2))
+                            diff = abs(canonical_a - canonical_b)
+                            if diff > tolerance_ms:
+                                issues.append(
+                                    AlignmentIssue(
+                                        source_id=transcript_b.source_id,
+                                        description=(
+                                            f"Text '{seg_a.text[:50]}...' differs "
+                                            f"by {diff}ms from {transcript_a.source_id}"
+                                        ),
+                                        severity="warning" if diff < tolerance_ms * 2 else "error",
+                                        suggested_fix=f"Adjust offset by {canonical_a - canonical_b}ms",
+                                    )
+                                )
 
-    def load_alignment(self, path: str) -> TimeAlignment:
-        """Load alignment from disk."""
-        data = json.loads(Path(path).read_text())
-        return TimeAlignment.model_validate(data)
+        return issues
+
+    def save_alignment_results(
+        self,
+        deployment: Deployment,
+        alignments: dict[str, AlignmentResult],
+    ) -> None:
+        """Save alignment results to the deployment's cache directory.
+
+        Args:
+            deployment: The Deployment entity
+            alignments: Alignment results to save
+        """
+        deploy_dir = self._get_deployment_dir(deployment.id)
+        alignment_path = deploy_dir / "cache" / "alignment" / "alignment.json"
+        alignment_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Convert to serializable format
+        data = {
+            source_id: result.model_dump()
+            for source_id, result in alignments.items()
+        }
+
+        alignment_path.write_text(json.dumps(data, indent=2))
+
+    def load_alignment_results(
+        self,
+        deployment: Deployment,
+    ) -> Optional[dict[str, AlignmentResult]]:
+        """Load cached alignment results.
+
+        Args:
+            deployment: The Deployment entity
+
+        Returns:
+            Alignment results if cached, None otherwise
+        """
+        deploy_dir = self._get_deployment_dir(deployment.id)
+        alignment_path = deploy_dir / "cache" / "alignment" / "alignment.json"
+
+        if not alignment_path.exists():
+            return None
+
+        data = json.loads(alignment_path.read_text())
+        return {
+            source_id: AlignmentResult.model_validate(result)
+            for source_id, result in data.items()
+        }
