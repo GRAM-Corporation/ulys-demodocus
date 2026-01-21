@@ -105,23 +105,26 @@ class TranscriptionService:
         source: Source,
         provider: str | None = None,
         language: str = "en",
+        local_base_path: str | Path | None = None,
     ) -> RawTranscript:
-        """Transcribe a source using S3 presigned URLs.
+        """Transcribe a source using local files or S3 presigned URLs.
 
         Args:
             source: The Source entity to transcribe
             provider: Override the default provider for this transcription
             language: Language code (default: en)
+            local_base_path: Base path for local video files (skips S3 if provided)
 
         Returns:
             RawTranscript with segments and speaker identification
 
         Raises:
             TranscriptionError: If transcription fails
-            ValueError: If S3 bucket is not configured
+            ValueError: If neither local path nor S3 bucket is configured
         """
-        if self.s3_bucket is None:
-            raise ValueError("S3 bucket not configured. Set GRAM_S3_BUCKET environment variable.")
+        use_local = local_base_path is not None
+        if not use_local and self.s3_bucket is None:
+            raise ValueError("Either local_base_path or GRAM_S3_BUCKET must be configured.")
 
         use_provider = provider or self.provider
 
@@ -137,18 +140,30 @@ class TranscriptionService:
         audio_duration = 0.0
 
         for source_file in source.files:
-            s3_key = self._get_s3_key(source, source_file.filename)
-            presigned_url = self._generate_presigned_url(s3_key)
+            # Get file path or URL
+            if use_local:
+                file_path = Path(local_base_path) / source_file.filename
+                if not file_path.exists():
+                    raise TranscriptionError(f"Local file not found: {file_path}")
 
-            # Call provider-specific transcription
-            if use_provider == "elevenlabs":
-                file_transcript = self._transcribe_elevenlabs(presigned_url, language)
-            elif use_provider == "assemblyai":
-                file_transcript = self._transcribe_assemblyai(presigned_url, language)
-            elif use_provider == "deepgram":
-                file_transcript = self._transcribe_deepgram(presigned_url, language)
+                # Call provider-specific transcription with local file
+                if use_provider == "elevenlabs":
+                    file_transcript = self._transcribe_elevenlabs_file(file_path, language)
+                else:
+                    raise NotImplementedError(f"Local file upload not yet implemented for {use_provider}")
             else:
-                raise NotImplementedError(f"Provider {use_provider} not yet implemented")
+                s3_key = self._get_s3_key(source, source_file.filename)
+                presigned_url = self._generate_presigned_url(s3_key)
+
+                # Call provider-specific transcription with URL
+                if use_provider == "elevenlabs":
+                    file_transcript = self._transcribe_elevenlabs(presigned_url, language)
+                elif use_provider == "assemblyai":
+                    file_transcript = self._transcribe_assemblyai(presigned_url, language)
+                elif use_provider == "deepgram":
+                    file_transcript = self._transcribe_deepgram(presigned_url, language)
+                else:
+                    raise NotImplementedError(f"Provider {use_provider} not yet implemented")
 
             # Adjust timestamps for file position within source
             for segment in file_transcript.segments:
@@ -232,6 +247,48 @@ class TranscriptionService:
             Params={"Bucket": self.s3_bucket, "Key": s3_key},
             ExpiresIn=expires_in,
         )
+
+    def _transcribe_elevenlabs_file(self, file_path: Path, language: str = "en") -> RawTranscript:
+        """Transcribe using ElevenLabs Scribe API with direct file upload.
+
+        Args:
+            file_path: Path to the local video/audio file
+            language: Language code
+
+        Returns:
+            RawTranscript with transcription results
+        """
+        api_url = "https://api.elevenlabs.io/v1/speech-to-text"
+
+        with open(file_path, "rb") as f:
+            files = {"file": (file_path.name, f, "video/mp4")}
+            data = {
+                "model_id": "scribe_v1",
+                "language_code": language,
+                "diarize": "true",
+                "timestamps_granularity": "word",
+            }
+
+            response = self._client.post(
+                api_url,
+                headers={"xi-api-key": self.api_key},
+                files=files,
+                data=data,
+                timeout=600.0,  # 10 min timeout for large files
+            )
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 60))
+            time.sleep(retry_after)
+            return self._transcribe_elevenlabs_file(file_path, language)
+
+        if response.status_code != 200:
+            raise TranscriptionError(
+                f"ElevenLabs API error: {response.status_code} - {response.text}"
+            )
+
+        result = response.json()
+        return self._parse_elevenlabs_response(result)
 
     def _transcribe_elevenlabs(self, url: str, language: str = "en") -> RawTranscript:
         """Transcribe using ElevenLabs Scribe API with URL.
