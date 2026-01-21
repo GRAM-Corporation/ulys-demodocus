@@ -1,0 +1,101 @@
+{
+  "id": "source:deploy:20260116_argos_los_angeles_01/gopro_02",
+  "deployment_id": "deploy:20260116_argos_los_angeles_01",
+  "device_type": "gopro",
+  "device_number": 2,
+  "device_model": null,
+  "operator": null,
+  "files": [
+    {
+      "filename": "GX010003 (1).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010003 (1).MP4",
+      "file_size_bytes": 2307065747,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "GX010004 (1).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010004 (1).MP4",
+      "file_size_bytes": 51852693,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "GX010005 (1).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010005 (1).MP4",
+      "file_size_bytes": 2217544467,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "GX010006 (1).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010006 (1).MP4",
+      "file_size_bytes": 2912218899,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "GX010007 (1).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010007 (1).MP4",
+      "file_size_bytes": 901953134,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "GX010008 (1).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010008 (1).MP4",
+      "file_size_bytes": 2760185022,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "GX010009 (1).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010009 (1).MP4",
+      "file_size_bytes": 1003738066,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    }
+  ],
+  "total_duration_seconds": 0.0,
+  "canonical_offset_ms": 0,
+  "alignment_confidence": 0.0,
+  "alignment_method": "unaligned",
+  "transcript_status": "pending",
+  "created_at": "2026-01-21T00:13:32.887379Z",
+  "updated_at": "2026-01-21T00:13:32.887383Z"
+}

@@ -1,5 +1,6 @@
 {
   "deployments": [
-    "deploy:20250119_vinci_01"
+    "deploy:20250119_vinci_01",
+    "deploy:20260116_argos_los_angeles_01"
   ]
 }

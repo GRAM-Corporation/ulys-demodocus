@@ -1,0 +1,23 @@
+{
+  "id": "deploy:20260116_argos_los_angeles_01",
+  "location": "argos-los-angeles",
+  "date": "2026-01-16",
+  "canonical_start_time": null,
+  "canonical_end_time": null,
+  "sources": [
+    "source:deploy:20260116_argos_los_angeles_01/gopro_01",
+    "source:deploy:20260116_argos_los_angeles_01/gopro_02",
+    "source:deploy:20260116_argos_los_angeles_01/gopro_03",
+    "source:deploy:20260116_argos_los_angeles_01/gopro_04",
+    "source:deploy:20260116_argos_los_angeles_01/phone_01",
+    "source:deploy:20260116_argos_los_angeles_01/phone_02",
+    "source:deploy:20260116_argos_los_angeles_01/drone_01"
+  ],
+  "team_members": [],
+  "notes": null,
+  "status": "ingesting",
+  "created_at": "2026-01-21T00:11:50.821811Z",
+  "updated_at": "2026-01-21T00:13:32.910967",
+  "checkpoint": null,
+  "error_message": null
+}

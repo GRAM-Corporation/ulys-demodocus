@@ -1,0 +1,53 @@
+{
+  "id": "source:deploy:20260116_argos_los_angeles_01/gopro_03",
+  "deployment_id": "deploy:20260116_argos_los_angeles_01",
+  "device_type": "gopro",
+  "device_number": 3,
+  "device_model": null,
+  "operator": null,
+  "files": [
+    {
+      "filename": "GX010003 (2).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010003 (2).MP4",
+      "file_size_bytes": 386719197,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "GX010004 (2).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010004 (2).MP4",
+      "file_size_bytes": 3898517134,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "GX010005 (2).MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/GX010005 (2).MP4",
+      "file_size_bytes": 173342833,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    }
+  ],
+  "total_duration_seconds": 0.0,
+  "canonical_offset_ms": 0,
+  "alignment_confidence": 0.0,
+  "alignment_method": "unaligned",
+  "transcript_status": "pending",
+  "created_at": "2026-01-21T00:13:32.892858Z",
+  "updated_at": "2026-01-21T00:13:32.892863Z"
+}

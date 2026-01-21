@@ -1,0 +1,65 @@
+{
+  "id": "source:deploy:20260116_argos_los_angeles_01/phone_01",
+  "deployment_id": "deploy:20260116_argos_los_angeles_01",
+  "device_type": "phone",
+  "device_number": 1,
+  "device_model": null,
+  "operator": null,
+  "files": [
+    {
+      "filename": "IMG_2735.MOV",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/IMG_2735.MOV",
+      "file_size_bytes": 11849606,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "IMG_2742.MOV",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/IMG_2742.MOV",
+      "file_size_bytes": 31419867,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "IMG_2771.MOV",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/IMG_2771.MOV",
+      "file_size_bytes": 6717494,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "IMG_2772.MOV",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/IMG_2772.MOV",
+      "file_size_bytes": 2031023,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    }
+  ],
+  "total_duration_seconds": 0.0,
+  "canonical_offset_ms": 0,
+  "alignment_confidence": 0.0,
+  "alignment_method": "unaligned",
+  "transcript_status": "pending",
+  "created_at": "2026-01-21T00:13:32.901622Z",
+  "updated_at": "2026-01-21T00:13:32.901625Z"
+}

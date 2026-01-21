@@ -11,9 +11,9 @@
       "updated_at": "2025-01-19T00:00:00Z"
     },
     {
-      "id": "person:chu",
-      "name": "Chu",
-      "aliases": [],
+      "id": "person:che",
+      "name": "Che",
+      "aliases": ["Chu"],
       "role": null,
       "voice_samples": [],
       "voice_embedding": null,

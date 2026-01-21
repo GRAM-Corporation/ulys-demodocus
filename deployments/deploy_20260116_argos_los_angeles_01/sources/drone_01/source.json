@@ -1,0 +1,89 @@
+{
+  "id": "source:deploy:20260116_argos_los_angeles_01/drone_01",
+  "deployment_id": "deploy:20260116_argos_los_angeles_01",
+  "device_type": "drone",
+  "device_number": 1,
+  "device_model": null,
+  "operator": null,
+  "files": [
+    {
+      "filename": "P1000011.MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/P1000011.MP4",
+      "file_size_bytes": 4286290469,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "P1000012.MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/P1000012.MP4",
+      "file_size_bytes": 1815613594,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "P1000013.MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/P1000013.MP4",
+      "file_size_bytes": 4286915456,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "P1000014.MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/P1000014.MP4",
+      "file_size_bytes": 1813799682,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "P1000023.MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/P1000023.MP4",
+      "file_size_bytes": 4287430077,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    },
+    {
+      "filename": "P1000024.MP4",
+      "file_path": "/workspace/260116_Argos_Los-Angeles/P1000024.MP4",
+      "file_size_bytes": 1644304791,
+      "duration_seconds": 0.0,
+      "start_offset_ms": 0,
+      "end_offset_ms": 0,
+      "video_codec": null,
+      "audio_codec": null,
+      "resolution": null,
+      "fps": null
+    }
+  ],
+  "total_duration_seconds": 0.0,
+  "canonical_offset_ms": 0,
+  "alignment_confidence": 0.0,
+  "alignment_method": "unaligned",
+  "transcript_status": "pending",
+  "created_at": "2026-01-21T00:13:32.909910Z",
+  "updated_at": "2026-01-21T00:13:32.909916Z"
+}
